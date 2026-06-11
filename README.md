@@ -91,9 +91,11 @@ Dataset ใช้กล้อง fixed CCTV ทั้งหมด 7 ตัว
 - เปิด synchronous mode
 - ตั้ง `fixed_delta_seconds = 1 / fps`
 - spawn รถเป็น CARLA vehicle actors
+- เว้น cooldown ก่อนรถคันถัดไป 3-5 วินาทีแบบ deterministic ด้วย `--random-seed`
 - spawn กล้องเป็น fixed `sensor.camera.rgb` actors
 - render วิดีโอจาก sensor จริงของ CARLA
 - project 3D vehicle bounding box ลงบนภาพ 2D
+- วาด parking slot marking บนกล้อง parking และทำ animation จอดแบบ approach/overshoot/reverse/correction
 - OCR ถูกปิดไว้ในรอบ POC นี้ เพื่อโฟกัส vehicle tracking และ parking ก่อน
 
 ---
@@ -296,6 +298,8 @@ python scripts/generate_carla_dataset.py --renderer carla --clean
 - `width`: 1280
 - `height`: 720
 - `carla-map`: Town05_Opt
+- spawn cooldown: 3-5 seconds
+- vehicle speed factor: 1.18-1.42
 - `carla-host`: 127.0.0.1
 - `carla-port`: 2000
 
@@ -345,7 +349,7 @@ Options:
 | `--carla-port` | `2000` | CARLA RPC port |
 | `--carla-map` | `Town05_Opt` | CARLA map ที่ใช้สร้าง POC; fallback เป็น `Town05` ถ้า `_Opt` ไม่มี |
 | `--carla-timeout-sec` | `120` | timeout สำหรับ CARLA RPC เช่น load/get world บน server ที่โหลดช้า |
-| `--random-seed` | `7` | seed สำหรับ start delay แบบ deterministic |
+| `--random-seed` | `7` | seed สำหรับ start delay 3-5 วินาทีแบบ deterministic |
 | `--camera-ids` | all | comma-separated camera IDs สำหรับ render เฉพาะบางกล้อง เช่น resume หลัง CARLA crash |
 | `--append-annotations` | off | append `annotations/bboxes.jsonl` แทนการเขียนใหม่ ใช้คู่กับ `--camera-ids` ตอน resume |
 | `--write-contact-sheets` | off | สร้างภาพ sample frames ต่อกล้องไว้ที่ `docs/video_contact_sheets/` สำหรับตรวจมุมกล้อง |

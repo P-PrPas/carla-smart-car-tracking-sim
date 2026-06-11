@@ -298,10 +298,10 @@ def make_cars(num_cars: int, random_seed: int) -> list[CarSpec]:
                 parking_slot_id=slot,
                 color_bgr=colors[idx % len(colors)],
                 start_offset_sec=start_offset_sec,
-                speed_factor=0.92 + (idx % 5) * 0.04,
+                speed_factor=1.18 + (idx % 5) * 0.06,
             )
         )
-        start_offset_sec += rng.uniform(1.0, 3.0)
+        start_offset_sec += rng.uniform(3.0, 5.0)
     return cars
 
 
@@ -367,8 +367,8 @@ def segment_window(car: CarSpec, camera_id: str) -> tuple[float, float] | None:
         return None
     base_start, base_end = SEGMENT_SECONDS[camera_id]
     return (
-        base_start + car.start_offset_sec,
-        base_end + car.start_offset_sec / car.speed_factor,
+        car.start_offset_sec + base_start / car.speed_factor,
+        car.start_offset_sec + base_end / car.speed_factor,
     )
 
 
@@ -676,6 +676,10 @@ def normalize_angle(angle: float) -> float:
     return angle
 
 
+def interpolate_yaw(start_yaw: float, end_yaw: float, alpha: float) -> float:
+    return start_yaw + normalize_angle(end_yaw - start_yaw) * max(0.0, min(1.0, alpha))
+
+
 def extend_waypoint_route(
     start_waypoint: object,
     count: int,
@@ -792,10 +796,53 @@ def build_carla_route(carla, world: object) -> CarlaRoute:
     raise RuntimeError("Could not find a usable start -> junction -> two-branch route in the selected map.")
 
 
-def path_for_car(route: CarlaRoute, car: CarSpec) -> tuple[object, ...]:
+def parking_maneuver_transforms(carla, road_transform: object, slot_transform: object) -> tuple[object, ...]:
+    road_yaw = road_transform.rotation.yaw
+    slot_yaw = slot_transform.rotation.yaw
+    slot_forward = yaw_to_forward(carla, slot_yaw)
+    road_forward = yaw_to_forward(carla, road_yaw)
+
+    staging = carla.Transform(
+        carla.Location(
+            x=slot_transform.location.x - slot_forward.x * 7.5,
+            y=slot_transform.location.y - slot_forward.y * 7.5,
+            z=slot_transform.location.z,
+        ),
+        carla.Rotation(pitch=0.0, yaw=road_yaw, roll=0.0),
+    )
+    overshoot = carla.Transform(
+        carla.Location(
+            x=slot_transform.location.x + road_forward.x * 5.5 - slot_forward.x * 2.5,
+            y=slot_transform.location.y + road_forward.y * 5.5 - slot_forward.y * 2.5,
+            z=slot_transform.location.z,
+        ),
+        carla.Rotation(pitch=0.0, yaw=road_yaw, roll=0.0),
+    )
+    reverse_entry = carla.Transform(
+        carla.Location(
+            x=slot_transform.location.x - slot_forward.x * 3.6,
+            y=slot_transform.location.y - slot_forward.y * 3.6,
+            z=slot_transform.location.z,
+        ),
+        carla.Rotation(pitch=0.0, yaw=interpolate_yaw(road_yaw, slot_yaw, 0.65), roll=0.0),
+    )
+    correction = carla.Transform(
+        carla.Location(
+            x=slot_transform.location.x + slot_forward.x * 0.7,
+            y=slot_transform.location.y + slot_forward.y * 0.7,
+            z=slot_transform.location.z,
+        ),
+        carla.Rotation(pitch=0.0, yaw=slot_yaw + 3.0, roll=0.0),
+    )
+    return (staging, overshoot, reverse_entry, slot_transform, correction, slot_transform)
+
+
+def path_for_car(carla, route: CarlaRoute, car: CarSpec) -> tuple[object, ...]:
     if car.status == "GOOD":
-        return tuple(route.common) + route.good + (route.good_slots[car.parking_slot_id],)
-    return tuple(route.common) + route.defect + (route.defect_slots[car.parking_slot_id],)
+        slot = route.good_slots[car.parking_slot_id]
+        return tuple(route.common) + route.good + parking_maneuver_transforms(carla, route.good[-1], slot)
+    slot = route.defect_slots[car.parking_slot_id]
+    return tuple(route.common) + route.defect + parking_maneuver_transforms(carla, route.defect[-1], slot)
 
 
 def validate_carla_route(route: CarlaRoute) -> None:
@@ -830,7 +877,12 @@ def route_transform_at(carla, transforms: tuple[object, ...], progress: float):
     scaled = progress * (len(transforms) - 1)
     idx = min(len(transforms) - 2, int(scaled))
     alpha = scaled - idx
-    return make_transform_between(carla, transforms[idx].location, transforms[idx + 1].location, alpha)
+    start = transforms[idx]
+    end = transforms[idx + 1]
+    loc = lerp_location(carla, start.location, end.location, alpha)
+    loc.z += 0.10
+    yaw = interpolate_yaw(start.rotation.yaw, end.rotation.yaw, alpha)
+    return carla.Transform(loc, carla.Rotation(pitch=0.0, yaw=yaw, roll=0.0))
 
 
 def clone_transform_with_offset(carla, transform: object, lateral_m: float = 0.0, z_m: float = 0.0):
@@ -865,7 +917,10 @@ def set_vehicle_transforms_for_time(
 ) -> None:
     for car_idx, car in enumerate(cars):
         start = car.start_offset_sec
-        end = max(start + 1.0, duration_sec - 2.0 + car.start_offset_sec * 0.05)
+        route_base_duration = max(end for _, end in SEGMENT_SECONDS.values())
+        drive_duration = route_base_duration / car.speed_factor + 4.0
+        end = min(duration_sec - 2.0, start + drive_duration)
+        end = max(start + 1.0, end)
         progress = (timestamp_sec - start) / (end - start)
         actor = vehicle_actors[car.tracking_id]
         if timestamp_sec < start:
@@ -880,32 +935,50 @@ def camera_targets_from_route(route: CarlaRoute) -> dict[str, object]:
     defect_last = len(route.defect) - 1
     return {
         "CAM_01_START": route.common[min(2, common_last)].location,
-        "CAM_02_TRANSIT": route.common[min(6, common_last)].location,
+        "CAM_02_TRANSIT": route.common[min(8, common_last)].location,
         "CAM_03_JUNCTION_STATUS": route.common[common_last].location,
-        "CAM_04_GOOD_ROUTE": route.good[min(7, good_last)].location,
-        "CAM_05_DEFECT_ROUTE": route.defect[min(7, defect_last)].location,
-        "CAM_06_GOOD_PARKING": route.good[good_last].location,
-        "CAM_07_DEFECT_PARKING": route.defect[defect_last].location,
+        "CAM_04_GOOD_ROUTE": route.good[min(10, good_last)].location,
+        "CAM_05_DEFECT_ROUTE": route.defect[min(10, defect_last)].location,
+        "CAM_06_GOOD_PARKING": average_transform_location(route.good_slots.values()),
+        "CAM_07_DEFECT_PARKING": average_transform_location(route.defect_slots.values()),
     }
+
+
+def average_transform_location(transforms: Iterable[object]) -> object:
+    transforms = tuple(transforms)
+    first = transforms[0]
+    location = type(first.location)()
+    location.x = sum(transform.location.x for transform in transforms) / len(transforms)
+    location.y = sum(transform.location.y for transform in transforms) / len(transforms)
+    location.z = sum(transform.location.z for transform in transforms) / len(transforms)
+    return location
 
 
 def build_camera_transforms(carla, route: CarlaRoute) -> dict[str, object]:
     targets = camera_targets_from_route(route)
-    reference_yaw = route.common[min(10, len(route.common) - 1)].rotation.yaw
+    yaw_by_camera = {
+        "CAM_01_START": route.common[min(3, len(route.common) - 1)].rotation.yaw,
+        "CAM_02_TRANSIT": route.common[min(8, len(route.common) - 1)].rotation.yaw,
+        "CAM_03_JUNCTION_STATUS": route.common[-1].rotation.yaw,
+        "CAM_04_GOOD_ROUTE": route.good[min(10, len(route.good) - 1)].rotation.yaw,
+        "CAM_05_DEFECT_ROUTE": route.defect[min(10, len(route.defect) - 1)].rotation.yaw,
+        "CAM_06_GOOD_PARKING": route.good[-1].rotation.yaw,
+        "CAM_07_DEFECT_PARKING": route.defect[-1].rotation.yaw,
+    }
     camera_plan = {
-        "CAM_01_START": {"yaw_offset": -130.0, "distance": 18.0, "height": 8.0},
-        "CAM_02_TRANSIT": {"yaw_offset": -145.0, "distance": 24.0, "height": 8.0},
+        "CAM_01_START": {"yaw_offset": -125.0, "distance": 18.0, "height": 9.0},
+        "CAM_02_TRANSIT": {"yaw_offset": -90.0, "distance": 18.0, "height": 14.0},
         "CAM_03_JUNCTION_STATUS": {"yaw_offset": 180.0, "distance": 28.0, "height": 10.0},
-        "CAM_04_GOOD_ROUTE": {"yaw_offset": -135.0, "distance": 24.0, "height": 8.0},
-        "CAM_05_DEFECT_ROUTE": {"yaw_offset": 135.0, "distance": 24.0, "height": 8.0},
-        "CAM_06_GOOD_PARKING": {"yaw_offset": -125.0, "distance": 30.0, "height": 12.0},
-        "CAM_07_DEFECT_PARKING": {"yaw_offset": 125.0, "distance": 30.0, "height": 12.0},
+        "CAM_04_GOOD_ROUTE": {"yaw_offset": -82.0, "distance": 20.0, "height": 13.0},
+        "CAM_05_DEFECT_ROUTE": {"yaw_offset": 82.0, "distance": 20.0, "height": 13.0},
+        "CAM_06_GOOD_PARKING": {"yaw_offset": -112.0, "distance": 34.0, "height": 15.0},
+        "CAM_07_DEFECT_PARKING": {"yaw_offset": 112.0, "distance": 34.0, "height": 15.0},
     }
     transforms: dict[str, object] = {}
     for camera in CAMERAS:
         target = targets[camera.camera_id]
         plan = camera_plan[camera.camera_id]
-        offset = yaw_to_forward(carla, reference_yaw + plan["yaw_offset"])
+        offset = yaw_to_forward(carla, yaw_by_camera[camera.camera_id] + plan["yaw_offset"])
         location = carla.Location(
             x=target.x + offset.x * plan["distance"],
             y=target.y + offset.y * plan["distance"],
@@ -960,6 +1033,65 @@ def project_actor_bbox(
     if x2 < 0 or y2 < 0 or x1 >= width or y1 >= height:
         return None
     return [x1, y1, x2, y2]
+
+
+def parking_slot_corners(carla, slot_transform: object, length_m: float = 5.8, width_m: float = 2.8) -> list[object]:
+    forward = yaw_to_forward(carla, slot_transform.rotation.yaw)
+    right = yaw_to_right(carla, slot_transform.rotation.yaw)
+    center = slot_transform.location
+    corners = []
+    for f_sign, r_sign in ((1, -1), (1, 1), (-1, 1), (-1, -1)):
+        corners.append(
+            carla.Location(
+                x=center.x + forward.x * f_sign * length_m * 0.5 + right.x * r_sign * width_m * 0.5,
+                y=center.y + forward.y * f_sign * length_m * 0.5 + right.y * r_sign * width_m * 0.5,
+                z=center.z + 0.08,
+            )
+        )
+    return corners
+
+
+def parking_lot_segments(carla, slots: dict[str, object]) -> list[tuple[object, object, str]]:
+    segments: list[tuple[object, object, str]] = []
+    for slot_id, slot_transform in slots.items():
+        corners = parking_slot_corners(carla, slot_transform)
+        for idx in range(len(corners)):
+            segments.append((corners[idx], corners[(idx + 1) % len(corners)], slot_id))
+    return segments
+
+
+def draw_world_parking_lot_markings(carla, world: object, route: CarlaRoute, duration_sec: float) -> None:
+    color_good = carla.Color(20, 240, 120)
+    color_defect = carla.Color(255, 90, 90)
+    for slots, color in ((route.good_slots, color_good), (route.defect_slots, color_defect)):
+        for start, end, slot_id in parking_lot_segments(carla, slots):
+            world.debug.draw_line(start, end, thickness=0.08, color=color, life_time=duration_sec + 30.0)
+        for slot_id, transform in slots.items():
+            label_loc = carla.Location(
+                x=transform.location.x,
+                y=transform.location.y,
+                z=transform.location.z + 0.15,
+            )
+            world.debug.draw_string(label_loc, slot_id, draw_shadow=False, color=color, life_time=duration_sec + 30.0)
+
+
+def overlay_projected_parking_lot(
+    frame: np.ndarray,
+    carla,
+    slots: dict[str, object],
+    camera_transform: object,
+    intrinsic: np.ndarray,
+    color_bgr: tuple[int, int, int],
+) -> None:
+    world_to_camera = np.array(camera_transform.get_inverse_matrix())
+    for start, end, _slot_id in parking_lot_segments(carla, slots):
+        x1, y1, d1 = get_image_point(start, intrinsic, world_to_camera)
+        x2, y2, d2 = get_image_point(end, intrinsic, world_to_camera)
+        if d1 <= 0.0 or d2 <= 0.0:
+            continue
+        pt1 = (int(round(x1)), int(round(y1)))
+        pt2 = (int(round(x2)), int(round(y2)))
+        cv2.line(frame, pt1, pt2, color_bgr, 3, cv2.LINE_AA)
 
 
 def image_to_bgr(image: object) -> np.ndarray:
@@ -1034,9 +1166,14 @@ def write_carla_route_plan(path: Path, route: CarlaRoute, carla_map: str) -> Non
             "good": {slot: transform_to_dict(transform) for slot, transform in route.good_slots.items()},
             "defect": {slot: transform_to_dict(transform) for slot, transform in route.defect_slots.items()},
         },
+        "motion": {
+            "spawn_cooldown_sec": "deterministic random 3.0-5.0",
+            "parking_maneuver": "approach, overshoot, reverse entry, correction, final stop",
+        },
         "validation": {
             "camera_overlap_required": True,
             "parking_final_transform_required": True,
+            "parking_lot_markings": "CARLA debug lines plus projected video overlay on parking cameras",
             "render_strategy": "one_active_rgb_sensor_per_camera",
         },
     }
@@ -1138,7 +1275,7 @@ def spawn_carla_vehicles(carla, world: object, cars: list[CarSpec], route: Carla
                 b, g, r = car.color_bgr
                 bp.set_attribute("color", f"{r},{g},{b}")
 
-            path = path_for_car(route, car)
+            path = path_for_car(carla, route, car)
             base_indices = [
                 min(len(path) - 1, idx * 3),
                 min(len(path) - 1, idx * 3 + 1),
@@ -1277,6 +1414,7 @@ def render_carla(
         log_step("Building route and camera transforms")
         route = build_carla_route(carla, world)
         camera_transforms = build_camera_transforms(carla, route)
+        draw_world_parking_lot_markings(carla, world, route, duration_sec)
         log_step(f"Spawning {len(cars)} vehicles")
         vehicle_actors = spawn_carla_vehicles(carla, world, cars, route)
         actors_to_destroy.extend(vehicle_actors.values())
@@ -1295,7 +1433,7 @@ def render_carla(
         write_carla_metadata(paths, cars, vehicle_actors, carla_version, resolved_map)
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        car_paths = {car.tracking_id: path_for_car(route, car) for car in cars}
+        car_paths = {car.tracking_id: path_for_car(carla, route, car) for car in cars}
         intrinsic = build_projection_matrix(width, height, 85.0)
         frame_count = int(duration_sec * fps)
         bbox_path = paths["annotations"] / "bboxes.jsonl"
@@ -1357,6 +1495,14 @@ def render_carla(
                         sim_frame = snapshot if isinstance(snapshot, int) else snapshot.frame
                         frame = image_to_bgr(get_sensor_frame(camera_queue, sim_frame))
                         camera_transform = camera_actor.get_transform()
+                        if camera.camera_id == "CAM_06_GOOD_PARKING":
+                            overlay_projected_parking_lot(
+                                frame, carla, route.good_slots, camera_transform, intrinsic, (70, 240, 120)
+                            )
+                        elif camera.camera_id == "CAM_07_DEFECT_PARKING":
+                            overlay_projected_parking_lot(
+                                frame, carla, route.defect_slots, camera_transform, intrinsic, (90, 90, 255)
+                            )
 
                         for car in cars:
                             visible_window = segment_window(car, camera.camera_id)
@@ -1514,6 +1660,9 @@ logic on machines that do not have CARLA installed.
 - Cameras: 7 fixed virtual CCTV viewpoints rendered by CARLA RGB sensors
 - Status rule: at `CAM_03_JUNCTION_STATUS`, left turn is `GOOD` and right turn is `DEFECT`
 - Parking slots: `G01-G06` for GOOD vehicles and `D01-D04` for DEFECT vehicles
+- Vehicle spawn cooldown: deterministic random 3-5 seconds
+- Parking behavior: approach, overshoot, reverse entry, correction, final stop
+- Parking lot markings: projected slot lines on parking camera videos
 - Bounding boxes: CARLA 3D vehicle bounding boxes projected into each camera plane
 - OCR is disabled for this POC iteration while vehicle tracking and parking are validated.
 

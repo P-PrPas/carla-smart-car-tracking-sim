@@ -14,6 +14,9 @@ logic on machines that do not have CARLA installed.
 - Cameras: 7 fixed virtual CCTV viewpoints rendered by CARLA RGB sensors
 - Status rule: at `CAM_03_JUNCTION_STATUS`, left turn is `GOOD` and right turn is `DEFECT`
 - Parking slots: `G01-G06` for GOOD vehicles and `D01-D04` for DEFECT vehicles
+- Vehicle spawn cooldown: deterministic random 3-5 seconds
+- Parking behavior: approach, overshoot, reverse entry, correction, final stop
+- Parking lot markings: projected slot lines on parking camera videos
 - Bounding boxes: CARLA 3D vehicle bounding boxes projected into each camera plane
 - OCR is disabled for this POC iteration while vehicle tracking and parking are validated.
 
