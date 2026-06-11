@@ -179,6 +179,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Write sampled video contact sheets under the docs directory for quick camera QA.",
     )
+    parser.add_argument(
+        "--hide-camera-blockers",
+        action="store_true",
+        help="Temporarily hide nearby static map objects that block CAM_02/CAM_03 visibility.",
+    )
     parser.add_argument("--clean", action="store_true", help="Remove previous generated outputs.")
     return parser.parse_args()
 
@@ -268,9 +273,11 @@ def make_cars(num_cars: int, random_seed: int) -> list[CarSpec]:
     good_slots = ["G01", "G02", "G03", "G04", "G05", "G06"]
     defect_slots = ["D01", "D02", "D03", "D04"]
     start_offset_sec = 0.0
+    good_count = 0
+    defect_count = 0
 
     for idx in range(num_cars):
-        status = "DEFECT" if idx % 3 == 1 else "GOOD"
+        status = "DEFECT" if idx % 2 == 1 else "GOOD"
         if status == "GOOD":
             route = (
                 "CAM_01_START",
@@ -279,7 +286,8 @@ def make_cars(num_cars: int, random_seed: int) -> list[CarSpec]:
                 "CAM_04_GOOD_ROUTE",
                 "CAM_06_GOOD_PARKING",
             )
-            slot = good_slots[(idx // 2) % len(good_slots)]
+            slot = good_slots[good_count % len(good_slots)]
+            good_count += 1
         else:
             route = (
                 "CAM_01_START",
@@ -288,7 +296,8 @@ def make_cars(num_cars: int, random_seed: int) -> list[CarSpec]:
                 "CAM_05_DEFECT_ROUTE",
                 "CAM_07_DEFECT_PARKING",
             )
-            slot = defect_slots[(idx // 3) % len(defect_slots)]
+            slot = defect_slots[defect_count % len(defect_slots)]
+            defect_count += 1
 
         cars.append(
             CarSpec(
@@ -954,11 +963,38 @@ def average_transform_location(transforms: Iterable[object]) -> object:
     return location
 
 
+def average_locations(carla, locations: Iterable[object]) -> object:
+    locations = tuple(locations)
+    return carla.Location(
+        x=sum(location.x for location in locations) / len(locations),
+        y=sum(location.y for location in locations) / len(locations),
+        z=sum(location.z for location in locations) / len(locations),
+    )
+
+
 def build_camera_transforms(carla, route: CarlaRoute) -> dict[str, object]:
     targets = camera_targets_from_route(route)
+    look_targets = dict(targets)
+    common_last = len(route.common) - 1
+    good_last = len(route.good) - 1
+    defect_last = len(route.defect) - 1
+
+    targets["CAM_02_TRANSIT"] = route.common[min(20, common_last)].location
+    look_targets["CAM_02_TRANSIT"] = route.common[min(26, common_last)].location
+    targets["CAM_03_JUNCTION_STATUS"] = route.common[common_last].location
+    look_targets["CAM_03_JUNCTION_STATUS"] = average_locations(
+        carla,
+        (
+            route.common[max(common_last - 2, 0)].location,
+            route.good[min(2, good_last)].location,
+            route.defect[min(5, defect_last)].location,
+        ),
+    )
+    look_targets["CAM_05_DEFECT_ROUTE"] = route.defect[min(13, defect_last)].location
+
     yaw_by_camera = {
         "CAM_01_START": route.common[min(3, len(route.common) - 1)].rotation.yaw,
-        "CAM_02_TRANSIT": route.common[min(8, len(route.common) - 1)].rotation.yaw,
+        "CAM_02_TRANSIT": route.common[min(20, len(route.common) - 1)].rotation.yaw,
         "CAM_03_JUNCTION_STATUS": route.common[-1].rotation.yaw,
         "CAM_04_GOOD_ROUTE": route.good[min(10, len(route.good) - 1)].rotation.yaw,
         "CAM_05_DEFECT_ROUTE": route.defect[min(10, len(route.defect) - 1)].rotation.yaw,
@@ -967,11 +1003,11 @@ def build_camera_transforms(carla, route: CarlaRoute) -> dict[str, object]:
     }
     camera_plan = {
         "CAM_01_START": {"yaw_offset": -125.0, "distance": 18.0, "height": 9.0},
-        "CAM_02_TRANSIT": {"yaw_offset": -90.0, "distance": 18.0, "height": 14.0},
-        "CAM_03_JUNCTION_STATUS": {"yaw_offset": 180.0, "distance": 28.0, "height": 10.0},
+        "CAM_02_TRANSIT": {"yaw_offset": 96.0, "distance": 28.0, "height": 14.0},
+        "CAM_03_JUNCTION_STATUS": {"yaw_offset": -48.0, "distance": 30.0, "height": 17.0},
         "CAM_04_GOOD_ROUTE": {"yaw_offset": -82.0, "distance": 20.0, "height": 13.0},
         "CAM_05_DEFECT_ROUTE": {"yaw_offset": 82.0, "distance": 20.0, "height": 13.0},
-        "CAM_06_GOOD_PARKING": {"yaw_offset": -112.0, "distance": 34.0, "height": 15.0},
+        "CAM_06_GOOD_PARKING": {"yaw_offset": 145.0, "distance": 34.0, "height": 15.0},
         "CAM_07_DEFECT_PARKING": {"yaw_offset": 112.0, "distance": 34.0, "height": 15.0},
     }
     transforms: dict[str, object] = {}
@@ -984,8 +1020,22 @@ def build_camera_transforms(carla, route: CarlaRoute) -> dict[str, object]:
             y=target.y + offset.y * plan["distance"],
             z=target.z + plan["height"],
         )
-        transforms[camera.camera_id] = carla.Transform(location, look_at_rotation(carla, location, target))
+        transforms[camera.camera_id] = carla.Transform(
+            location,
+            look_at_rotation(carla, location, look_targets[camera.camera_id]),
+        )
     return transforms
+
+
+def carla_camera_fovs() -> dict[str, float]:
+    return {
+        camera.camera_id: {
+            "CAM_02_TRANSIT": 74.0,
+            "CAM_03_JUNCTION_STATUS": 66.0,
+            "CAM_06_GOOD_PARKING": 72.0,
+        }.get(camera.camera_id, 85.0)
+        for camera in CAMERAS
+    }
 
 
 def build_projection_matrix(width: int, height: int, fov: float) -> np.ndarray:
@@ -1215,9 +1265,9 @@ def call_carla_rpc(description: str, fn):
 
 def set_weather(carla, world: object) -> None:
     weather = carla.WeatherParameters(
-        cloudiness=10.0,
+        cloudiness=35.0,
         precipitation=0.0,
-        sun_altitude_angle=55.0,
+        sun_altitude_angle=35.0,
         sun_azimuth_angle=35.0,
         fog_density=0.0,
         wetness=0.0,
@@ -1225,10 +1275,90 @@ def set_weather(carla, world: object) -> None:
     world.set_weather(weather)
 
 
+def distance_xy(a: object, b: object) -> float:
+    return math.hypot(a.x - b.x, a.y - b.y)
+
+
+def distance_to_segment_xy(point: object, start: object, end: object) -> float:
+    dx = end.x - start.x
+    dy = end.y - start.y
+    length_sq = dx * dx + dy * dy
+    if length_sq <= 1e-6:
+        return distance_xy(point, start)
+    t = ((point.x - start.x) * dx + (point.y - start.y) * dy) / length_sq
+    t = max(0.0, min(1.0, t))
+    closest = type(start)()
+    closest.x = start.x + t * dx
+    closest.y = start.y + t * dy
+    closest.z = getattr(start, "z", 0.0)
+    return distance_xy(point, closest)
+
+
+def environment_object_location(obj: object) -> object | None:
+    bounding_box = getattr(obj, "bounding_box", None)
+    if bounding_box is not None and hasattr(bounding_box, "location"):
+        return bounding_box.location
+    transform = getattr(obj, "transform", None)
+    if transform is not None and hasattr(transform, "location"):
+        return transform.location
+    return None
+
+
+def maybe_get_city_label(carla, name: str):
+    return getattr(carla.CityObjectLabel, name, None)
+
+
+def hide_camera_blockers(carla, world: object, route: CarlaRoute, camera_transforms: dict[str, object]) -> set[int]:
+    if not hasattr(world, "get_environment_objects") or not hasattr(world, "enable_environment_objects"):
+        log_step("Environment object visibility toggling is not available on this CARLA server.")
+        return set()
+
+    blocker_segments = (
+        (
+            camera_transforms["CAM_02_TRANSIT"].location,
+            route.common[min(26, len(route.common) - 1)].location,
+            14.0,
+        ),
+        (
+            camera_transforms["CAM_03_JUNCTION_STATUS"].location,
+            route.common[-1].location,
+            16.0,
+        ),
+    )
+    hidden_ids: set[int] = set()
+    for label_name in ("Buildings", "Fences", "Walls", "Vegetation", "Poles", "Other"):
+        label = maybe_get_city_label(carla, label_name)
+        if label is None:
+            continue
+        try:
+            objects = world.get_environment_objects(label)
+        except RuntimeError:
+            continue
+        for obj in objects:
+            location = environment_object_location(obj)
+            if location is None:
+                continue
+            blocks_view = any(
+                distance_to_segment_xy(location, start, end) <= radius
+                or distance_xy(location, start) <= radius * 0.75
+                for start, end, radius in blocker_segments
+            )
+            if blocks_view:
+                hidden_ids.add(obj.id)
+
+    if hidden_ids:
+        world.enable_environment_objects(hidden_ids, False)
+        log_step(f"Temporarily hid {len(hidden_ids)} static environment objects near CAM_02/CAM_03.")
+    else:
+        log_step("No nearby CAM_02/CAM_03 static blockers were selected for hiding.")
+    return hidden_ids
+
+
 def spawn_carla_cameras(
     carla,
     world: object,
     camera_transforms: dict[str, object],
+    camera_fovs: dict[str, float],
     width: int,
     height: int,
     fps: int,
@@ -1237,12 +1367,11 @@ def spawn_carla_cameras(
     camera_bp = blueprint_library.find("sensor.camera.rgb")
     camera_bp.set_attribute("image_size_x", str(width))
     camera_bp.set_attribute("image_size_y", str(height))
-    camera_bp.set_attribute("fov", "85")
     camera_bp.set_attribute("sensor_tick", str(1.0 / fps))
     for attr, value in {
         "enable_postprocess_effects": "True",
         "exposure_mode": "manual",
-        "exposure_compensation": "0",
+        "exposure_compensation": "-1.0",
         "gamma": "2.2",
         "motion_blur_intensity": "0.0",
     }.items():
@@ -1252,6 +1381,7 @@ def spawn_carla_cameras(
     cameras: dict[str, object] = {}
     queues: dict[str, queue.Queue] = {}
     for camera_id, transform in camera_transforms.items():
+        camera_bp.set_attribute("fov", f"{camera_fovs.get(camera_id, 85.0):.1f}")
         sensor = world.spawn_actor(camera_bp, transform)
         sensor_queue: queue.Queue = queue.Queue()
         sensor.listen(sensor_queue.put)
@@ -1318,6 +1448,7 @@ def spawn_carla_vehicles(carla, world: object, cars: list[CarSpec], route: Carla
 def write_carla_camera_graph(
     path: Path,
     camera_transforms: dict[str, object],
+    camera_fovs: dict[str, float],
     width: int,
     height: int,
     fps: int,
@@ -1340,7 +1471,7 @@ def write_carla_camera_graph(
             {
                 **asdict(camera),
                 "camera_transform": transform_to_dict(camera_transforms[camera.camera_id]),
-                "fov": 85.0,
+                "fov": camera_fovs[camera.camera_id],
             }
             for camera in CAMERAS
         ],
@@ -1387,6 +1518,7 @@ def render_carla(
     timeout_sec: float,
     cameras_to_render: list[CameraSpec],
     append_annotations: bool,
+    hide_static_blockers: bool,
 ) -> str:
     carla = import_carla_module()
     log_step(f"Connecting to CARLA at {host}:{port} with timeout {timeout_sec:.0f}s")
@@ -1401,6 +1533,7 @@ def render_carla(
     original_settings = world.get_settings()
     actors_to_destroy: list[object] = []
     writers: dict[str, cv2.VideoWriter] = {}
+    hidden_environment_ids: set[int] = set()
 
     try:
         log_step("Configuring synchronous simulation")
@@ -1414,6 +1547,9 @@ def render_carla(
         log_step("Building route and camera transforms")
         route = build_carla_route(carla, world)
         camera_transforms = build_camera_transforms(carla, route)
+        camera_fovs = carla_camera_fovs()
+        if hide_static_blockers:
+            hidden_environment_ids = hide_camera_blockers(carla, world, route, camera_transforms)
         draw_world_parking_lot_markings(carla, world, route, duration_sec)
         log_step(f"Spawning {len(cars)} vehicles")
         vehicle_actors = spawn_carla_vehicles(carla, world, cars, route)
@@ -1424,6 +1560,7 @@ def render_carla(
         write_carla_camera_graph(
             paths["metadata"] / "camera_graph.json",
             camera_transforms,
+            camera_fovs,
             width,
             height,
             fps,
@@ -1434,7 +1571,6 @@ def render_carla(
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         car_paths = {car.tracking_id: path_for_car(carla, route, car) for car in cars}
-        intrinsic = build_projection_matrix(width, height, 85.0)
         frame_count = int(duration_sec * fps)
         bbox_path = paths["annotations"] / "bboxes.jsonl"
 
@@ -1448,6 +1584,7 @@ def render_carla(
                     carla,
                     world,
                     {camera.camera_id: camera_transforms[camera.camera_id]},
+                    camera_fovs,
                     width,
                     height,
                     fps,
@@ -1463,6 +1600,7 @@ def render_carla(
                 writers[camera.camera_id] = writer
 
                 try:
+                    intrinsic = build_projection_matrix(width, height, camera_fovs[camera.camera_id])
                     warmup_frames = max(2, min(10, fps))
                     warmup = ProgressBar(f"warming {camera.camera_id}", warmup_frames)
                     for warmup_frame in range(warmup_frames):
@@ -1570,6 +1708,11 @@ def render_carla(
                 if hasattr(actor, "stop"):
                     actor.stop()
                 actor.destroy()
+            except RuntimeError:
+                pass
+        if hidden_environment_ids:
+            try:
+                world.enable_environment_objects(hidden_environment_ids, True)
             except RuntimeError:
                 pass
         world.apply_settings(original_settings)
@@ -1785,6 +1928,7 @@ def main() -> int:
             args.carla_timeout_sec,
             cameras_to_render,
             args.append_annotations,
+            args.hide_camera_blockers,
         )
         print(f"Generated CARLA 3D CCTV videos with CARLA {carla_version}.")
     else:
