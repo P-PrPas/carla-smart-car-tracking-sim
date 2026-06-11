@@ -15,8 +15,9 @@ import csv
 import json
 import math
 import queue
-import re
+import random
 import shutil
+import socket
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -29,7 +30,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 CAMERA_IDS = [
-    "CAM_01_START_OCR",
+    "CAM_01_START",
     "CAM_02_TRANSIT",
     "CAM_03_JUNCTION_STATUS",
     "CAM_04_GOOD_ROUTE",
@@ -56,7 +57,6 @@ class CameraSpec:
 @dataclass(frozen=True)
 class CarSpec:
     tracking_id: str
-    oil_tank_id: str
     status: str
     route: tuple[str, ...]
     parking_slot_id: str
@@ -76,9 +76,9 @@ class CarlaRoute:
 
 CAMERAS: tuple[CameraSpec, ...] = (
     CameraSpec(
-        "CAM_01_START_OCR",
-        "Start OCR",
-        "Vehicle identification and six-digit oil tank ID OCR.",
+        "CAM_01_START",
+        "Start",
+        "Vehicle detection at the production-line exit.",
         ("START",),
         ("CAM_02_TRANSIT",),
         (130, 240),
@@ -137,7 +137,7 @@ CAMERAS: tuple[CameraSpec, ...] = (
 
 
 SEGMENT_SECONDS = {
-    "CAM_01_START_OCR": (0.0, 8.0),
+    "CAM_01_START": (0.0, 9.0),
     "CAM_02_TRANSIT": (7.0, 15.0),
     "CAM_03_JUNCTION_STATUS": (14.0, 23.0),
     "CAM_04_GOOD_ROUTE": (22.0, 31.0),
@@ -154,30 +154,101 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="datasets/carla_honda_poc")
     parser.add_argument("--docs-dir", default="docs")
     parser.add_argument("--renderer", choices=("storyboard", "carla"), default="storyboard")
-    parser.add_argument("--num-cars", type=int, default=10)
+    parser.add_argument("--num-cars", type=int, default=6)
     parser.add_argument("--fps", type=int, default=10)
-    parser.add_argument("--duration-sec", type=float, default=45.0)
+    parser.add_argument("--duration-sec", type=float, default=60.0)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
-    parser.add_argument("--oil-start", type=int, default=100001)
     parser.add_argument("--carla-host", default="127.0.0.1")
     parser.add_argument("--carla-port", type=int, default=2000)
+    parser.add_argument("--carla-map", default="Town05_Opt")
+    parser.add_argument("--carla-timeout-sec", type=float, default=120.0)
+    parser.add_argument("--random-seed", type=int, default=7)
+    parser.add_argument(
+        "--camera-ids",
+        default="",
+        help="Comma-separated camera IDs to render. Default renders all cameras.",
+    )
+    parser.add_argument(
+        "--append-annotations",
+        action="store_true",
+        help="Append to annotations/bboxes.jsonl instead of replacing it. Useful for camera-by-camera resume.",
+    )
+    parser.add_argument(
+        "--write-contact-sheets",
+        action="store_true",
+        help="Write sampled video contact sheets under the docs directory for quick camera QA.",
+    )
     parser.add_argument("--clean", action="store_true", help="Remove previous generated outputs.")
     return parser.parse_args()
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if not 8 <= args.num_cars <= 12:
-        raise ValueError("--num-cars must be between 8 and 12 for the Small POC dataset.")
+    if not 5 <= args.num_cars <= 6:
+        raise ValueError("--num-cars must be between 5 and 6 for the focused POC dataset.")
     if args.fps <= 0:
         raise ValueError("--fps must be positive.")
-    if args.duration_sec < 30:
-        raise ValueError("--duration-sec must be at least 30 seconds.")
+    if args.duration_sec < 45:
+        raise ValueError("--duration-sec must be at least 45 seconds.")
     if args.width < 640 or args.height < 360:
-        raise ValueError("--width/--height are too small for readable OCR preview.")
+        raise ValueError("--width/--height are too small for vehicle tracking review.")
+    if args.carla_timeout_sec <= 0:
+        raise ValueError("--carla-timeout-sec must be positive.")
+    if args.camera_ids:
+        valid_camera_ids = set(CAMERA_IDS)
+        requested = {camera_id.strip() for camera_id in args.camera_ids.split(",") if camera_id.strip()}
+        unknown = sorted(requested - valid_camera_ids)
+        if unknown:
+            raise ValueError(f"Unknown --camera-ids values: {', '.join(unknown)}")
 
 
-def make_cars(num_cars: int, oil_start: int) -> list[CarSpec]:
+def selected_cameras(camera_ids: str) -> list[CameraSpec]:
+    if not camera_ids:
+        return list(CAMERAS)
+    requested = {camera_id.strip() for camera_id in camera_ids.split(",") if camera_id.strip()}
+    return [camera for camera in CAMERAS if camera.camera_id in requested]
+
+
+def log_step(message: str) -> None:
+    print(f"[generate] {message}", flush=True)
+
+
+class ProgressBar:
+    def __init__(self, label: str, total: int, width: int = 32) -> None:
+        self.label = label
+        self.total = max(1, total)
+        self.width = width
+        self.current = 0
+        self.started_at = time.monotonic()
+        self.last_render_at = 0.0
+
+    def update(self, current: int | None = None, advance: int = 1, extra: str = "") -> None:
+        if current is None:
+            self.current += advance
+        else:
+            self.current = current
+        self.current = max(0, min(self.current, self.total))
+        now = time.monotonic()
+        if self.current < self.total and now - self.last_render_at < 0.2:
+            return
+        self.last_render_at = now
+        ratio = self.current / self.total
+        filled = int(self.width * ratio)
+        bar = "#" * filled + "-" * (self.width - filled)
+        elapsed = now - self.started_at
+        rate = self.current / elapsed if elapsed > 0 else 0.0
+        suffix = f" | {extra}" if extra else ""
+        print(
+            f"\r[{bar}] {self.label} {self.current}/{self.total} "
+            f"({ratio * 100:5.1f}%) {rate:5.1f}/s{suffix}",
+            end="",
+            flush=True,
+        )
+        if self.current >= self.total:
+            print(flush=True)
+
+
+def make_cars(num_cars: int, random_seed: int) -> list[CarSpec]:
     colors = [
         (210, 210, 205),
         (190, 195, 200),
@@ -193,14 +264,16 @@ def make_cars(num_cars: int, oil_start: int) -> list[CarSpec]:
         (212, 216, 218),
     ]
     cars: list[CarSpec] = []
+    rng = random.Random(random_seed)
     good_slots = ["G01", "G02", "G03", "G04", "G05", "G06"]
     defect_slots = ["D01", "D02", "D03", "D04"]
+    start_offset_sec = 0.0
 
     for idx in range(num_cars):
-        status = "GOOD" if idx % 3 != 1 else "DEFECT"
+        status = "DEFECT" if idx % 3 == 1 else "GOOD"
         if status == "GOOD":
             route = (
-                "CAM_01_START_OCR",
+                "CAM_01_START",
                 "CAM_02_TRANSIT",
                 "CAM_03_JUNCTION_STATUS",
                 "CAM_04_GOOD_ROUTE",
@@ -209,7 +282,7 @@ def make_cars(num_cars: int, oil_start: int) -> list[CarSpec]:
             slot = good_slots[(idx // 2) % len(good_slots)]
         else:
             route = (
-                "CAM_01_START_OCR",
+                "CAM_01_START",
                 "CAM_02_TRANSIT",
                 "CAM_03_JUNCTION_STATUS",
                 "CAM_05_DEFECT_ROUTE",
@@ -217,22 +290,18 @@ def make_cars(num_cars: int, oil_start: int) -> list[CarSpec]:
             )
             slot = defect_slots[(idx // 3) % len(defect_slots)]
 
-        oil_tank_id = f"{oil_start + idx:06d}"
-        if not re.fullmatch(r"\d{6}", oil_tank_id):
-            raise ValueError(f"oil_tank_id must be six digits: {oil_tank_id}")
-
         cars.append(
             CarSpec(
                 tracking_id=f"TRK_{idx + 1:04d}",
-                oil_tank_id=oil_tank_id,
                 status=status,
                 route=route,
                 parking_slot_id=slot,
                 color_bgr=colors[idx % len(colors)],
-                start_offset_sec=idx * 2.2,
+                start_offset_sec=start_offset_sec,
                 speed_factor=0.92 + (idx % 5) * 0.04,
             )
         )
+        start_offset_sec += rng.uniform(1.0, 3.0)
     return cars
 
 
@@ -254,7 +323,7 @@ def write_camera_graph(path: Path) -> None:
     graph = {
         "dataset": "carla_honda_poc",
         "renderer": "storyboard",
-        "carla_map": "Town05",
+        "carla_map": "Town05_Opt/Town05",
         "note": "Storyboard preview only. Final POC dataset must be generated with --renderer carla.",
         "status_rule": {
             "camera_id": "CAM_03_JUNCTION_STATUS",
@@ -272,7 +341,6 @@ def write_cars_csv(path: Path, cars: Iterable[CarSpec]) -> None:
             fh,
             fieldnames=[
                 "tracking_id",
-                "oil_tank_id",
                 "status",
                 "route",
                 "parking_slot_id",
@@ -285,7 +353,6 @@ def write_cars_csv(path: Path, cars: Iterable[CarSpec]) -> None:
             writer.writerow(
                 {
                     "tracking_id": car.tracking_id,
-                    "oil_tank_id": car.oil_tank_id,
                     "status": car.status,
                     "route": ">".join(car.route),
                     "parking_slot_id": car.parking_slot_id,
@@ -431,18 +498,6 @@ def draw_car(
     draw.ellipse((x1 + 8, y2 - 13, x1 + 24, y2 + 3), fill=(20, 20, 20))
     draw.ellipse((x2 - 24, y2 - 13, x2 - 8, y2 + 3), fill=(20, 20, 20))
 
-    if camera_id == "CAM_01_START_OCR":
-        tag_x1 = x1 + int((x2 - x1) * 0.23)
-        tag_x2 = x2 - int((x2 - x1) * 0.23)
-        tag_y1 = y1 + 9
-        tag_y2 = tag_y1 + max(18, int((y2 - y1) * 0.28))
-        draw.rectangle((tag_x1, tag_y1, tag_x2, tag_y2), fill=(255, 255, 245), outline=(40, 40, 40))
-        text_font = font(max(16, int((tag_y2 - tag_y1) * 0.74)))
-        text_box = draw.textbbox((0, 0), car.oil_tank_id, font=text_font)
-        tx = tag_x1 + ((tag_x2 - tag_x1) - (text_box[2] - text_box[0])) // 2
-        ty = tag_y1 + ((tag_y2 - tag_y1) - (text_box[3] - text_box[1])) // 2 - 1
-        draw.text((tx, ty), car.oil_tank_id, font=text_font, fill=(10, 10, 10))
-
     label = f"{car.tracking_id} {car.status}"
     draw.text((x1, max(4, y1 - 22)), label, fill=(255, 255, 255))
 
@@ -454,7 +509,6 @@ def write_events(path: Path, cars: Iterable[CarSpec]) -> None:
                 start, end = segment_window(car, camera_id) or (0.0, 0.0)
                 event = {
                     "tracking_id": car.tracking_id,
-                    "oil_tank_id": car.oil_tank_id,
                     "status": car.status,
                     "camera_id": camera_id,
                     "enter_timestamp_sec": round(start, 3),
@@ -478,6 +532,7 @@ def render_storyboard(
 
     with bbox_path.open("w", encoding="utf-8") as bbox_fh:
         for camera in CAMERAS:
+            progress = ProgressBar(f"storyboard {camera.camera_id}", frame_count)
             video_path = paths["videos"] / f"{camera.camera_id}.mp4"
             writer = cv2.VideoWriter(str(video_path), fourcc, fps, (width, height))
             if not writer.isOpened():
@@ -500,7 +555,6 @@ def render_storyboard(
                     draw_car(draw, camera.camera_id, car, bbox, width, height)
                     record = {
                         "tracking_id": car.tracking_id,
-                        "oil_tank_id": car.oil_tank_id,
                         "status": car.status,
                         "route": list(car.route),
                         "camera_id": camera.camera_id,
@@ -508,12 +562,12 @@ def render_storyboard(
                         "timestamp_sec": round(timestamp_sec, 3),
                         "bbox": bbox,
                         "bbox_source": "storyboard_2d",
-                        "ocr_bbox": bbox if camera.camera_id == "CAM_01_START_OCR" else None,
                         "parking_slot_id": car.parking_slot_id if camera.camera_id.endswith("PARKING") else "",
                     }
                     bbox_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
                 writer.write(cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR))
+                progress.update(frame_id + 1)
             writer.release()
 
 
@@ -563,7 +617,7 @@ def look_at_rotation(carla, origin: object, target: object):
     dz = target.z - origin.z
     distance_xy = max(0.001, vector_length(dx, dy))
     yaw = math.degrees(math.atan2(dy, dx))
-    pitch = -math.degrees(math.atan2(dz, distance_xy))
+    pitch = math.degrees(math.atan2(dz, distance_xy))
     return carla.Rotation(pitch=pitch, yaw=yaw, roll=0.0)
 
 
@@ -614,6 +668,113 @@ def sample_forward_route(carla, world_map: object, spawn_transform: object, coun
     return transforms
 
 
+def normalize_angle(angle: float) -> float:
+    while angle > 180.0:
+        angle -= 360.0
+    while angle < -180.0:
+        angle += 360.0
+    return angle
+
+
+def extend_waypoint_route(
+    start_waypoint: object,
+    count: int,
+    step_m: float,
+    preferred_yaw: float | None = None,
+) -> list[object]:
+    waypoint = start_waypoint
+    transforms = [waypoint.transform]
+    for _ in range(count - 1):
+        next_waypoints = waypoint.next(step_m)
+        if not next_waypoints:
+            break
+        if preferred_yaw is None:
+            waypoint = min(
+                next_waypoints,
+                key=lambda candidate: abs(
+                    normalize_angle(candidate.transform.rotation.yaw - waypoint.transform.rotation.yaw)
+                ),
+            )
+        else:
+            waypoint = min(
+                next_waypoints,
+                key=lambda candidate: abs(normalize_angle(candidate.transform.rotation.yaw - preferred_yaw)),
+            )
+        preferred_yaw = waypoint.transform.rotation.yaw
+        transforms.append(waypoint.transform)
+    return transforms
+
+
+def find_route_through_junction(carla, world_map: object, spawn_transform: object) -> CarlaRoute | None:
+    waypoint = world_map.get_waypoint(
+        spawn_transform.location, project_to_road=True, lane_type=carla.LaneType.Driving
+    )
+    common_waypoints = [waypoint]
+    step_m = 4.0
+
+    for _ in range(36):
+        next_waypoints = waypoint.next(step_m)
+        if not next_waypoints:
+            return None
+        if len(next_waypoints) >= 2 and len(common_waypoints) >= 8:
+            current_yaw = waypoint.transform.rotation.yaw
+            sorted_next = sorted(
+                next_waypoints,
+                key=lambda candidate: normalize_angle(candidate.transform.rotation.yaw - current_yaw),
+            )
+            left_wp = sorted_next[0]
+            right_wp = sorted_next[-1]
+            if left_wp.id == right_wp.id:
+                return None
+            common = [wp.transform for wp in common_waypoints]
+            good = extend_waypoint_route(left_wp, count=18, step_m=step_m)
+            defect = extend_waypoint_route(right_wp, count=18, step_m=step_m)
+            if len(good) < 10 or len(defect) < 10:
+                return None
+            return CarlaRoute(
+                common=tuple(common),
+                good=tuple(good),
+                defect=tuple(defect),
+                good_slots=make_parking_slots(carla, good, "G", 6, side_sign=-1.0),
+                defect_slots=make_parking_slots(carla, defect, "D", 4, side_sign=1.0),
+            )
+
+        waypoint = min(
+            next_waypoints,
+            key=lambda candidate: abs(
+                normalize_angle(candidate.transform.rotation.yaw - waypoint.transform.rotation.yaw)
+            ),
+        )
+        common_waypoints.append(waypoint)
+    return None
+
+
+def make_parking_slots(
+    carla,
+    branch_transforms: list[object],
+    prefix: str,
+    count: int,
+    side_sign: float,
+) -> dict[str, object]:
+    base = branch_transforms[-1]
+    forward = yaw_to_forward(carla, base.rotation.yaw)
+    right = yaw_to_right(carla, base.rotation.yaw)
+    result = {}
+    for idx in range(count):
+        row = idx // 3
+        col = idx % 3
+        loc = carla.Location(
+            x=base.location.x + forward.x * (col * 4.2) + right.x * side_sign * (6.5 + row * 4.5),
+            y=base.location.y + forward.y * (col * 4.2) + right.y * side_sign * (6.5 + row * 4.5),
+            z=base.location.z + 0.10,
+        )
+        result[f"{prefix}{idx + 1:02d}"] = carla.Transform(
+            loc,
+            carla.Rotation(pitch=0.0, yaw=base.rotation.yaw + side_sign * 90.0, roll=0.0),
+        )
+    return result
+
+
 def build_carla_route(carla, world: object) -> CarlaRoute:
     world_map = world.get_map()
     spawn_points = sorted(
@@ -621,58 +782,45 @@ def build_carla_route(carla, world: object) -> CarlaRoute:
         key=lambda transform: (round(transform.location.x, 2), round(transform.location.y, 2)),
     )
     if not spawn_points:
-        raise RuntimeError("Town05 returned no spawn points.")
+        raise RuntimeError("CARLA map returned no spawn points.")
 
-    common = sample_forward_route(carla, world_map, spawn_points[0], count=24, step_m=4.0)
-    junction = common[14]
-    forward = yaw_to_forward(carla, junction.rotation.yaw)
-    right = yaw_to_right(carla, junction.rotation.yaw)
-
-    def branch(sign: float, count: int) -> list[object]:
-        transforms = []
-        for idx in range(count):
-            dist = 5.0 + idx * 4.0
-            lateral = sign * min(18.0, 3.0 + idx * 2.2)
-            loc = carla.Location(
-                x=junction.location.x + forward.x * dist + right.x * lateral,
-                y=junction.location.y + forward.y * dist + right.y * lateral,
-                z=junction.location.z,
-            )
-            transforms.append(project_to_road(carla, world_map, loc))
-        return transforms
-
-    good = branch(-1.0, 18)
-    defect = branch(1.0, 18)
-
-    def slots(branch_transforms: list[object], prefix: str, count: int, sign: float) -> dict[str, object]:
-        base = branch_transforms[-1]
-        base_forward = yaw_to_forward(carla, base.rotation.yaw)
-        base_right = yaw_to_right(carla, base.rotation.yaw)
-        result = {}
-        for idx in range(count):
-            loc = carla.Location(
-                x=base.location.x + base_forward.x * (idx * 2.5) + base_right.x * sign * (4.0 + idx * 1.1),
-                y=base.location.y + base_forward.y * (idx * 2.5) + base_right.y * sign * (4.0 + idx * 1.1),
-                z=base.location.z,
-            )
-            slot_transform = project_to_road(carla, world_map, loc)
-            slot_transform.rotation.yaw = base.rotation.yaw + sign * 72.0
-            result[f"{prefix}{idx + 1:02d}"] = slot_transform
-        return result
-
-    return CarlaRoute(
-        common=tuple(common),
-        good=tuple(good),
-        defect=tuple(defect),
-        good_slots=slots(good, "G", 6, -1.0),
-        defect_slots=slots(defect, "D", 4, 1.0),
-    )
+    for spawn_transform in spawn_points:
+        route = find_route_through_junction(carla, world_map, spawn_transform)
+        if route is not None:
+            validate_carla_route(route)
+            return route
+    raise RuntimeError("Could not find a usable start -> junction -> two-branch route in the selected map.")
 
 
 def path_for_car(route: CarlaRoute, car: CarSpec) -> tuple[object, ...]:
     if car.status == "GOOD":
-        return tuple(route.common[:15]) + route.good + (route.good_slots[car.parking_slot_id],)
-    return tuple(route.common[:15]) + route.defect + (route.defect_slots[car.parking_slot_id],)
+        return tuple(route.common) + route.good + (route.good_slots[car.parking_slot_id],)
+    return tuple(route.common) + route.defect + (route.defect_slots[car.parking_slot_id],)
+
+
+def validate_carla_route(route: CarlaRoute) -> None:
+    if len(route.common) < 8:
+        raise RuntimeError("Route common segment is too short for start/transit/junction cameras.")
+    if len(route.good) < 10 or len(route.defect) < 10:
+        raise RuntimeError("Route branches are too short for route and parking cameras.")
+    expected_good = {f"G{idx + 1:02d}" for idx in range(6)}
+    expected_defect = {f"D{idx + 1:02d}" for idx in range(4)}
+    if set(route.good_slots) != expected_good:
+        raise RuntimeError("GOOD parking slots are incomplete.")
+    if set(route.defect_slots) != expected_defect:
+        raise RuntimeError("DEFECT parking slots are incomplete.")
+    for camera_id, next_camera_ids in {
+        "CAM_01_START": ("CAM_02_TRANSIT",),
+        "CAM_02_TRANSIT": ("CAM_03_JUNCTION_STATUS",),
+        "CAM_03_JUNCTION_STATUS": ("CAM_04_GOOD_ROUTE", "CAM_05_DEFECT_ROUTE"),
+        "CAM_04_GOOD_ROUTE": ("CAM_06_GOOD_PARKING",),
+        "CAM_05_DEFECT_ROUTE": ("CAM_07_DEFECT_PARKING",),
+    }.items():
+        end = SEGMENT_SECONDS[camera_id][1]
+        for next_camera_id in next_camera_ids:
+            start = SEGMENT_SECONDS[next_camera_id][0]
+            if end < start:
+                raise RuntimeError(f"Camera segment {camera_id} has no overlap with {next_camera_id}.")
 
 
 def route_transform_at(carla, transforms: tuple[object, ...], progress: float):
@@ -685,37 +833,83 @@ def route_transform_at(carla, transforms: tuple[object, ...], progress: float):
     return make_transform_between(carla, transforms[idx].location, transforms[idx + 1].location, alpha)
 
 
+def clone_transform_with_offset(carla, transform: object, lateral_m: float = 0.0, z_m: float = 0.0):
+    right = yaw_to_right(carla, transform.rotation.yaw)
+    location = carla.Location(
+        x=transform.location.x + right.x * lateral_m,
+        y=transform.location.y + right.y * lateral_m,
+        z=transform.location.z + z_m,
+    )
+    rotation = carla.Rotation(
+        pitch=transform.rotation.pitch,
+        yaw=transform.rotation.yaw,
+        roll=transform.rotation.roll,
+    )
+    return carla.Transform(location, rotation)
+
+
+def hidden_vehicle_transform(carla, idx: int):
+    return carla.Transform(
+        carla.Location(x=-10000.0, y=-10000.0 - idx * 12.0, z=-100.0),
+        carla.Rotation(),
+    )
+
+
+def set_vehicle_transforms_for_time(
+    carla,
+    cars: list[CarSpec],
+    vehicle_actors: dict[str, object],
+    car_paths: dict[str, tuple[object, ...]],
+    timestamp_sec: float,
+    duration_sec: float,
+) -> None:
+    for car_idx, car in enumerate(cars):
+        start = car.start_offset_sec
+        end = max(start + 1.0, duration_sec - 2.0 + car.start_offset_sec * 0.05)
+        progress = (timestamp_sec - start) / (end - start)
+        actor = vehicle_actors[car.tracking_id]
+        if timestamp_sec < start:
+            actor.set_transform(hidden_vehicle_transform(carla, car_idx))
+        else:
+            actor.set_transform(route_transform_at(carla, car_paths[car.tracking_id], progress))
+
+
 def camera_targets_from_route(route: CarlaRoute) -> dict[str, object]:
+    common_last = len(route.common) - 1
+    good_last = len(route.good) - 1
+    defect_last = len(route.defect) - 1
     return {
-        "CAM_01_START_OCR": route.common[2].location,
-        "CAM_02_TRANSIT": route.common[8].location,
-        "CAM_03_JUNCTION_STATUS": route.common[14].location,
-        "CAM_04_GOOD_ROUTE": route.good[7].location,
-        "CAM_05_DEFECT_ROUTE": route.defect[7].location,
-        "CAM_06_GOOD_PARKING": route.good[-1].location,
-        "CAM_07_DEFECT_PARKING": route.defect[-1].location,
+        "CAM_01_START": route.common[min(2, common_last)].location,
+        "CAM_02_TRANSIT": route.common[min(6, common_last)].location,
+        "CAM_03_JUNCTION_STATUS": route.common[common_last].location,
+        "CAM_04_GOOD_ROUTE": route.good[min(7, good_last)].location,
+        "CAM_05_DEFECT_ROUTE": route.defect[min(7, defect_last)].location,
+        "CAM_06_GOOD_PARKING": route.good[good_last].location,
+        "CAM_07_DEFECT_PARKING": route.defect[defect_last].location,
     }
 
 
 def build_camera_transforms(carla, route: CarlaRoute) -> dict[str, object]:
     targets = camera_targets_from_route(route)
+    reference_yaw = route.common[min(10, len(route.common) - 1)].rotation.yaw
+    camera_plan = {
+        "CAM_01_START": {"yaw_offset": -130.0, "distance": 18.0, "height": 8.0},
+        "CAM_02_TRANSIT": {"yaw_offset": -145.0, "distance": 24.0, "height": 8.0},
+        "CAM_03_JUNCTION_STATUS": {"yaw_offset": 180.0, "distance": 28.0, "height": 10.0},
+        "CAM_04_GOOD_ROUTE": {"yaw_offset": -135.0, "distance": 24.0, "height": 8.0},
+        "CAM_05_DEFECT_ROUTE": {"yaw_offset": 135.0, "distance": 24.0, "height": 8.0},
+        "CAM_06_GOOD_PARKING": {"yaw_offset": -125.0, "distance": 30.0, "height": 12.0},
+        "CAM_07_DEFECT_PARKING": {"yaw_offset": 125.0, "distance": 30.0, "height": 12.0},
+    }
     transforms: dict[str, object] = {}
     for camera in CAMERAS:
         target = targets[camera.camera_id]
-        if "GOOD" in camera.camera_id:
-            offset_yaw = -135.0
-        elif "DEFECT" in camera.camera_id:
-            offset_yaw = 135.0
-        elif camera.camera_id == "CAM_03_JUNCTION_STATUS":
-            offset_yaw = 180.0
-        else:
-            offset_yaw = -160.0
-        reference_yaw = route.common[min(10, len(route.common) - 1)].rotation.yaw + offset_yaw
-        offset = yaw_to_forward(carla, reference_yaw)
+        plan = camera_plan[camera.camera_id]
+        offset = yaw_to_forward(carla, reference_yaw + plan["yaw_offset"])
         location = carla.Location(
-            x=target.x + offset.x * 22.0,
-            y=target.y + offset.y * 22.0,
-            z=target.z + 9.0,
+            x=target.x + offset.x * plan["distance"],
+            y=target.y + offset.y * plan["distance"],
+            z=target.z + plan["height"],
         )
         transforms[camera.camera_id] = carla.Transform(location, look_at_rotation(carla, location, target))
     return transforms
@@ -768,45 +962,6 @@ def project_actor_bbox(
     return [x1, y1, x2, y2]
 
 
-def projected_oil_tag_bbox(car_bbox: list[int]) -> list[int] | None:
-    x1, y1, x2, y2 = car_bbox
-    bw = x2 - x1
-    bh = y2 - y1
-    if bw < 80 or bh < 40:
-        return None
-    tag_w = int(bw * 0.34)
-    tag_h = int(max(18, bh * 0.18))
-    cx = int((x1 + x2) / 2)
-    tag_x1 = max(0, cx - tag_w // 2)
-    tag_y1 = max(0, y1 + int(bh * 0.18))
-    return [tag_x1, tag_y1, tag_x1 + tag_w, tag_y1 + tag_h]
-
-
-def overlay_oil_tag(frame_bgr: np.ndarray, oil_tank_id: str, tag_bbox: list[int]) -> None:
-    x1, y1, x2, y2 = tag_bbox
-    x2 = min(frame_bgr.shape[1] - 1, x2)
-    y2 = min(frame_bgr.shape[0] - 1, y2)
-    if x2 <= x1 or y2 <= y1:
-        return
-    cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (245, 245, 255), thickness=-1)
-    cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (20, 20, 20), thickness=1)
-    font_scale = max(0.45, min(1.25, (y2 - y1) / 28.0))
-    thickness = max(1, int(round(font_scale * 2)))
-    text_size, _ = cv2.getTextSize(oil_tank_id, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-    tx = x1 + max(2, ((x2 - x1) - text_size[0]) // 2)
-    ty = y1 + max(text_size[1] + 2, ((y2 - y1) + text_size[1]) // 2)
-    cv2.putText(
-        frame_bgr,
-        oil_tank_id,
-        (tx, ty),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        font_scale,
-        (5, 5, 5),
-        thickness,
-        cv2.LINE_AA,
-    )
-
-
 def image_to_bgr(image: object) -> np.ndarray:
     array = np.frombuffer(image.raw_data, dtype=np.uint8)
     array = np.reshape(array, (image.height, image.width, 4))
@@ -825,6 +980,100 @@ def get_sensor_frame(sensor_queue: queue.Queue, frame: int, timeout_sec: float =
         if image.frame > frame:
             raise RuntimeError(f"Camera queue skipped simulation frame {frame}; received {image.frame}.")
     raise RuntimeError(f"Timed out waiting for camera frame {frame}.")
+
+
+def map_name_matches(current_map: str, requested_map: str) -> bool:
+    return current_map.rsplit("/", 1)[-1] == requested_map
+
+
+def resolve_carla_map(client: object, requested_map: str) -> str:
+    available = client.get_available_maps()
+    available_short = {name.rsplit("/", 1)[-1]: name for name in available}
+    if requested_map in available_short:
+        return requested_map
+    if requested_map.endswith("_Opt"):
+        fallback = requested_map.removesuffix("_Opt")
+        if fallback in available_short:
+            log_step(f"Map {requested_map} is not available; falling back to {fallback}")
+            return fallback
+    raise RuntimeError(
+        f"CARLA map {requested_map} is not available. Available maps: "
+        + ", ".join(sorted(available_short))
+    )
+
+
+def get_or_load_carla_map(client: object, requested_map: str) -> tuple[object, str]:
+    resolved_map = resolve_carla_map(client, requested_map)
+    world = client.get_world()
+    current_map = world.get_map().name
+    if map_name_matches(current_map, resolved_map):
+        log_step(f"Using already loaded map: {current_map}")
+        return world, resolved_map
+    log_step(f"Loading {resolved_map} from current map {current_map}. This can take a while.")
+    return client.load_world(resolved_map), resolved_map
+
+
+def write_carla_route_plan(path: Path, route: CarlaRoute, carla_map: str) -> None:
+    plan = {
+        "dataset": "carla_honda_poc",
+        "carla_map": carla_map,
+        "route_flow": [
+            "CAM_01_START",
+            "CAM_02_TRANSIT",
+            "CAM_03_JUNCTION_STATUS",
+            "CAM_04_GOOD_ROUTE/CAM_05_DEFECT_ROUTE",
+            "CAM_06_GOOD_PARKING/CAM_07_DEFECT_PARKING",
+        ],
+        "segment_windows_sec": SEGMENT_SECONDS,
+        "route": {
+            "common": [transform_to_dict(transform) for transform in route.common],
+            "good": [transform_to_dict(transform) for transform in route.good],
+            "defect": [transform_to_dict(transform) for transform in route.defect],
+        },
+        "parking_slots": {
+            "good": {slot: transform_to_dict(transform) for slot, transform in route.good_slots.items()},
+            "defect": {slot: transform_to_dict(transform) for slot, transform in route.defect_slots.items()},
+        },
+        "validation": {
+            "camera_overlap_required": True,
+            "parking_final_transform_required": True,
+            "render_strategy": "one_active_rgb_sensor_per_camera",
+        },
+    }
+    path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
+
+
+def wait_for_tcp_port(host: str, port: int, timeout_sec: float) -> None:
+    deadline = time.monotonic() + timeout_sec
+    last_error: OSError | None = None
+    progress = ProgressBar(f"waiting for TCP {host}:{port}", max(1, int(timeout_sec)))
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=2.0):
+                progress.update(progress.total)
+                return
+        except OSError as exc:
+            last_error = exc
+            elapsed = int(timeout_sec - max(0.0, deadline - time.monotonic()))
+            progress.update(elapsed, extra=str(exc))
+            time.sleep(1.0)
+    detail = f" Last socket error: {last_error}" if last_error else ""
+    raise RuntimeError(
+        f"CARLA server is not accepting TCP connections at {host}:{port} after "
+        f"{timeout_sec:.0f}s.{detail} Start the CARLA Docker server and keep it running."
+    )
+
+
+def call_carla_rpc(description: str, fn):
+    try:
+        return fn()
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"CARLA TCP port is open, but RPC call '{description}' timed out or failed. "
+            "The simulator may still be loading, hung, or running in a bad state. "
+            "Check the CARLA Docker terminal/logs and restart the CARLA container if needed. "
+            f"Original error: {exc}"
+        ) from exc
 
 
 def set_weather(carla, world: object) -> None:
@@ -851,7 +1100,7 @@ def spawn_carla_cameras(
     camera_bp = blueprint_library.find("sensor.camera.rgb")
     camera_bp.set_attribute("image_size_x", str(width))
     camera_bp.set_attribute("image_size_y", str(height))
-    camera_bp.set_attribute("fov", "70")
+    camera_bp.set_attribute("fov", "85")
     camera_bp.set_attribute("sensor_tick", str(1.0 / fps))
     for attr, value in {
         "enable_postprocess_effects": "True",
@@ -882,16 +1131,50 @@ def spawn_carla_vehicles(carla, world: object, cars: list[CarSpec], route: Carla
     ]
     vehicle_bp = preferred[0] if preferred else vehicle_blueprints[0]
     actors: dict[str, object] = {}
-    for idx, car in enumerate(cars):
-        bp = vehicle_bp
-        if bp.has_attribute("color"):
-            b, g, r = car.color_bgr
-            bp.set_attribute("color", f"{r},{g},{b}")
-        transform = path_for_car(route, car)[0]
-        transform.location.z += 0.2 + idx * 0.005
-        actor = world.spawn_actor(bp, transform)
-        actor.set_simulate_physics(False)
-        actors[car.tracking_id] = actor
+    try:
+        for idx, car in enumerate(cars):
+            bp = vehicle_bp
+            if bp.has_attribute("color"):
+                b, g, r = car.color_bgr
+                bp.set_attribute("color", f"{r},{g},{b}")
+
+            path = path_for_car(route, car)
+            base_indices = [
+                min(len(path) - 1, idx * 3),
+                min(len(path) - 1, idx * 3 + 1),
+                min(len(path) - 1, idx * 3 + 2),
+                min(len(path) - 1, idx * 4),
+            ]
+            lateral_offsets = (0.0, 3.5, -3.5, 7.0, -7.0)
+            z_offsets = (0.5, 1.5, 2.5)
+
+            actor = None
+            for base_idx in dict.fromkeys(base_indices):
+                for lateral_m in lateral_offsets:
+                    for z_m in z_offsets:
+                        transform = clone_transform_with_offset(carla, path[base_idx], lateral_m, z_m)
+                        actor = world.try_spawn_actor(bp, transform)
+                        if actor is not None:
+                            break
+                    if actor is not None:
+                        break
+                if actor is not None:
+                    break
+
+            if actor is None:
+                raise RuntimeError(
+                    f"Could not spawn vehicle {car.tracking_id}; every candidate position collided."
+                )
+
+            actor.set_simulate_physics(False)
+            actors[car.tracking_id] = actor
+    except Exception:
+        for actor in actors.values():
+            try:
+                actor.destroy()
+            except RuntimeError:
+                pass
+        raise
     return actors
 
 
@@ -902,11 +1185,12 @@ def write_carla_camera_graph(
     height: int,
     fps: int,
     carla_version: str,
+    carla_map: str,
 ) -> None:
     graph = {
         "dataset": "carla_honda_poc",
         "renderer": "carla",
-        "carla_map": "Town05",
+        "carla_map": carla_map,
         "carla_version": carla_version,
         "fps": fps,
         "resolution": {"width": width, "height": height},
@@ -919,7 +1203,7 @@ def write_carla_camera_graph(
             {
                 **asdict(camera),
                 "camera_transform": transform_to_dict(camera_transforms[camera.camera_id]),
-                "fov": 70.0,
+                "fov": 85.0,
             }
             for camera in CAMERAS
         ],
@@ -932,6 +1216,7 @@ def write_carla_metadata(
     cars: list[CarSpec],
     actors: dict[str, object],
     carla_version: str,
+    carla_map: str,
 ) -> None:
     write_cars_csv(paths["metadata"] / "cars.csv", cars)
     with (paths["metadata"] / "events.jsonl").open("w", encoding="utf-8") as fh:
@@ -940,11 +1225,10 @@ def write_carla_metadata(
                 start, end = segment_window(car, camera_id) or (0.0, 0.0)
                 event = {
                     "tracking_id": car.tracking_id,
-                    "oil_tank_id": car.oil_tank_id,
                     "status": car.status,
                     "camera_id": camera_id,
                     "vehicle_actor_id": actors[car.tracking_id].id,
-                    "carla_map": "Town05",
+                    "carla_map": carla_map,
                     "carla_version": carla_version,
                     "enter_timestamp_sec": round(start, 3),
                     "exit_timestamp_sec": round(end, 3),
@@ -962,20 +1246,27 @@ def render_carla(
     duration_sec: float,
     width: int,
     height: int,
+    carla_map: str,
+    timeout_sec: float,
+    cameras_to_render: list[CameraSpec],
+    append_annotations: bool,
 ) -> str:
     carla = import_carla_module()
+    log_step(f"Connecting to CARLA at {host}:{port} with timeout {timeout_sec:.0f}s")
+    wait_for_tcp_port(host, port, min(timeout_sec, 30.0))
     client = carla.Client(host, port)
-    client.set_timeout(20.0)
-    carla_version = client.get_client_version()
+    client.set_timeout(timeout_sec)
+    carla_version = call_carla_rpc("get_client_version", client.get_client_version)
     if "0.9.15" not in carla_version:
         raise RuntimeError(f"Expected CARLA 0.9.15 client, got {carla_version}.")
 
-    world = client.load_world("Town05")
+    world, resolved_map = call_carla_rpc("get/load CARLA map", lambda: get_or_load_carla_map(client, carla_map))
     original_settings = world.get_settings()
     actors_to_destroy: list[object] = []
     writers: dict[str, cv2.VideoWriter] = {}
 
     try:
+        log_step("Configuring synchronous simulation")
         settings = world.get_settings()
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 1.0 / fps
@@ -983,13 +1274,15 @@ def render_carla(
         world.apply_settings(settings)
         set_weather(carla, world)
 
+        log_step("Building route and camera transforms")
         route = build_carla_route(carla, world)
         camera_transforms = build_camera_transforms(carla, route)
-        camera_actors, camera_queues = spawn_carla_cameras(carla, world, camera_transforms, width, height, fps)
+        log_step(f"Spawning {len(cars)} vehicles")
         vehicle_actors = spawn_carla_vehicles(carla, world, cars, route)
-        actors_to_destroy.extend(camera_actors.values())
         actors_to_destroy.extend(vehicle_actors.values())
 
+        log_step("Writing CARLA metadata")
+        write_carla_route_plan(paths["metadata"] / "route_plan.json", route, resolved_map)
         write_carla_camera_graph(
             paths["metadata"] / "camera_graph.json",
             camera_transforms,
@@ -997,76 +1290,139 @@ def render_carla(
             height,
             fps,
             carla_version,
+            resolved_map,
         )
-        write_carla_metadata(paths, cars, vehicle_actors, carla_version)
+        write_carla_metadata(paths, cars, vehicle_actors, carla_version, resolved_map)
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        for camera in CAMERAS:
-            video_path = paths["videos"] / f"{camera.camera_id}.mp4"
-            writer = cv2.VideoWriter(str(video_path), fourcc, fps, (width, height))
-            if not writer.isOpened():
-                raise RuntimeError(f"Could not open video writer: {video_path}")
-            writers[camera.camera_id] = writer
-
         car_paths = {car.tracking_id: path_for_car(route, car) for car in cars}
-        intrinsic = build_projection_matrix(width, height, 70.0)
+        intrinsic = build_projection_matrix(width, height, 85.0)
         frame_count = int(duration_sec * fps)
         bbox_path = paths["annotations"] / "bboxes.jsonl"
 
-        with bbox_path.open("w", encoding="utf-8") as bbox_fh:
-            for local_frame_id in range(frame_count):
-                timestamp_sec = local_frame_id / fps
-                for car in cars:
-                    start = car.start_offset_sec
-                    end = max(start + 1.0, duration_sec - 2.0 + car.start_offset_sec * 0.05)
-                    progress = (timestamp_sec - start) / (end - start)
-                    actor = vehicle_actors[car.tracking_id]
-                    actor.set_transform(route_transform_at(carla, car_paths[car.tracking_id], progress))
+        projection_records = 0
+        fallback_records = 0
+        bbox_mode = "a" if append_annotations and bbox_path.exists() else "w"
+        with bbox_path.open(bbox_mode, encoding="utf-8") as bbox_fh:
+            for camera in cameras_to_render:
+                log_step(f"Rendering {camera.camera_id} with one active RGB sensor")
+                camera_actors, camera_queues = spawn_carla_cameras(
+                    carla,
+                    world,
+                    {camera.camera_id: camera_transforms[camera.camera_id]},
+                    width,
+                    height,
+                    fps,
+                )
+                camera_actor = camera_actors[camera.camera_id]
+                camera_queue = camera_queues[camera.camera_id]
+                video_path = paths["videos"] / f"{camera.camera_id}.mp4"
+                writer = cv2.VideoWriter(str(video_path), fourcc, fps, (width, height))
+                if not writer.isOpened():
+                    camera_actor.stop()
+                    camera_actor.destroy()
+                    raise RuntimeError(f"Could not open video writer: {video_path}")
+                writers[camera.camera_id] = writer
 
-                snapshot = world.tick()
-                sim_frame = snapshot if isinstance(snapshot, int) else snapshot.frame
-                frames = {
-                    camera.camera_id: image_to_bgr(get_sensor_frame(camera_queues[camera.camera_id], sim_frame))
-                    for camera in CAMERAS
-                }
+                try:
+                    warmup_frames = max(2, min(10, fps))
+                    warmup = ProgressBar(f"warming {camera.camera_id}", warmup_frames)
+                    for warmup_frame in range(warmup_frames):
+                        set_vehicle_transforms_for_time(
+                            carla,
+                            cars,
+                            vehicle_actors,
+                            car_paths,
+                            0.0,
+                            duration_sec,
+                        )
+                        world.tick()
+                        while not camera_queue.empty():
+                            camera_queue.get_nowait()
+                        warmup.update(warmup_frame + 1)
 
-                for camera in CAMERAS:
-                    camera_transform = camera_actors[camera.camera_id].get_transform()
-                    frame = frames[camera.camera_id]
-                    for car in cars:
-                        actor = vehicle_actors[car.tracking_id]
-                        bbox = project_actor_bbox(actor, camera_transform, intrinsic, width, height)
-                        if not bbox:
-                            continue
-                        ocr_bbox = None
-                        if camera.camera_id == "CAM_01_START_OCR":
-                            ocr_bbox = projected_oil_tag_bbox(bbox)
-                            if ocr_bbox:
-                                overlay_oil_tag(frame, car.oil_tank_id, ocr_bbox)
-                        record = {
-                            "tracking_id": car.tracking_id,
-                            "oil_tank_id": car.oil_tank_id,
-                            "status": car.status,
-                            "route": list(car.route),
-                            "camera_id": camera.camera_id,
-                            "frame_id": local_frame_id,
-                            "carla_frame": sim_frame,
-                            "timestamp_sec": round(timestamp_sec, 3),
-                            "bbox": bbox,
-                            "bbox_source": "carla_3d_projection",
-                            "ocr_bbox": ocr_bbox,
-                            "parking_slot_id": car.parking_slot_id if camera.camera_id.endswith("PARKING") else "",
-                            "vehicle_actor_id": actor.id,
-                            "camera_transform": transform_to_dict(camera_transform),
-                            "world_transform": transform_to_dict(actor.get_transform()),
-                        }
-                        bbox_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    writers[camera.camera_id].write(frame)
+                    render_progress = ProgressBar(f"rendering {camera.camera_id}", frame_count)
+                    for local_frame_id in range(frame_count):
+                        timestamp_sec = local_frame_id / fps
+                        set_vehicle_transforms_for_time(
+                            carla,
+                            cars,
+                            vehicle_actors,
+                            car_paths,
+                            timestamp_sec,
+                            duration_sec,
+                        )
+
+                        snapshot = world.tick()
+                        sim_frame = snapshot if isinstance(snapshot, int) else snapshot.frame
+                        frame = image_to_bgr(get_sensor_frame(camera_queue, sim_frame))
+                        camera_transform = camera_actor.get_transform()
+
+                        for car in cars:
+                            visible_window = segment_window(car, camera.camera_id)
+                            if visible_window is None:
+                                continue
+                            visible_start, visible_end = visible_window
+                            if timestamp_sec < visible_start or timestamp_sec > visible_end:
+                                continue
+                            actor = vehicle_actors[car.tracking_id]
+                            bbox = project_actor_bbox(actor, camera_transform, intrinsic, width, height)
+                            bbox_source = "carla_3d_projection"
+                            if bbox:
+                                projection_records += 1
+                            else:
+                                bbox = visible_bbox(camera.camera_id, car, timestamp_sec, width, height)
+                                bbox_source = "carla_timing_fallback"
+                                if not bbox:
+                                    continue
+                                fallback_records += 1
+                            record = {
+                                "tracking_id": car.tracking_id,
+                                "status": car.status,
+                                "route": list(car.route),
+                                "camera_id": camera.camera_id,
+                                "frame_id": local_frame_id,
+                                "carla_frame": sim_frame,
+                                "timestamp_sec": round(timestamp_sec, 3),
+                                "bbox": bbox,
+                                "bbox_source": bbox_source,
+                                "parking_slot_id": car.parking_slot_id if camera.camera_id.endswith("PARKING") else "",
+                                "vehicle_actor_id": actor.id,
+                                "camera_transform": transform_to_dict(camera_transform),
+                                "world_transform": transform_to_dict(actor.get_transform()),
+                            }
+                            bbox_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        writer.write(frame)
+                        render_progress.update(
+                            local_frame_id + 1,
+                            extra=f"sim_frame={sim_frame}",
+                        )
+                finally:
+                    writer.release()
+                    writers.pop(camera.camera_id, None)
+                    try:
+                        camera_actor.stop()
+                        camera_actor.destroy()
+                        world.tick()
+                    except RuntimeError:
+                        pass
+        log_step(
+            "Annotation records written: "
+            f"{projection_records} projected, {fallback_records} timing fallback"
+        )
+        if projection_records == 0:
+            raise RuntimeError(
+                "CARLA camera projection produced 0 bounding boxes. "
+                "Camera placement is likely wrong; inspect generated videos/contact sheets."
+            )
     finally:
+        log_step("Cleaning up CARLA actors and restoring settings")
         for writer in writers.values():
             writer.release()
         for actor in actors_to_destroy:
             try:
+                if hasattr(actor, "stop"):
+                    actor.stop()
                 actor.destroy()
             except RuntimeError:
                 pass
@@ -1081,9 +1437,9 @@ def validate_carla_connection(host: str, port: int) -> None:
     client = carla.Client(host, port)
     client.set_timeout(10.0)
     version = client.get_client_version()
-    world = client.load_world("Town05")
+    world, resolved_map = get_or_load_carla_map(client, "Town05_Opt")
     world.wait_for_tick()
-    print(f"Connected to CARLA client {version}; loaded {world.get_map().name}.")
+    print(f"Connected to CARLA client {version}; loaded {world.get_map().name} ({resolved_map}).")
 
 
 def draw_map_png(path: Path) -> None:
@@ -1097,7 +1453,7 @@ def draw_map_png(path: Path) -> None:
     draw.text((34, 26), "Honda Smart Car Tracking POC - Camera Map", font=title_font, fill=(24, 32, 42))
 
     edges = [
-        ("CAM_01_START_OCR", "CAM_02_TRANSIT"),
+        ("CAM_01_START", "CAM_02_TRANSIT"),
         ("CAM_02_TRANSIT", "CAM_03_JUNCTION_STATUS"),
         ("CAM_03_JUNCTION_STATUS", "CAM_04_GOOD_ROUTE"),
         ("CAM_03_JUNCTION_STATUS", "CAM_05_DEFECT_ROUTE"),
@@ -1153,20 +1509,20 @@ logic on machines that do not have CARLA installed.
 
 ## Scenario
 
-- CARLA target map: `Town05`
-- Dataset scale: Small POC, 8-12 vehicles
+- CARLA target map: `Town05_Opt` with fallback to `Town05`
+- Dataset scale: Focused POC, 5-6 vehicles
 - Cameras: 7 fixed virtual CCTV viewpoints rendered by CARLA RGB sensors
-- Oil tank IDs: six-digit numeric strings only, starting at `100001`
 - Status rule: at `CAM_03_JUNCTION_STATUS`, left turn is `GOOD` and right turn is `DEFECT`
 - Parking slots: `G01-G06` for GOOD vehicles and `D01-D04` for DEFECT vehicles
 - Bounding boxes: CARLA 3D vehicle bounding boxes projected into each camera plane
-- OCR label: six-digit oil tank ID projected onto the windshield region in `CAM_01_START_OCR`
+- OCR is disabled for this POC iteration while vehicle tracking and parking are validated.
 
 ## Generated Files
 
 - `{output_dir}/videos/*.mp4`
 - `{output_dir}/metadata/cars.csv`
 - `{output_dir}/metadata/camera_graph.json`
+- `{output_dir}/metadata/route_plan.json` (CARLA renderer)
 - `{output_dir}/metadata/events.jsonl`
 - `{output_dir}/annotations/bboxes.jsonl`
 - `docs/carla_honda_poc_map.png`
@@ -1188,17 +1544,54 @@ python scripts/generate_carla_dataset.py --renderer storyboard --clean
     path.write_text(text, encoding="utf-8")
 
 
-def validate_outputs(output_dir: Path, cars: list[CarSpec]) -> None:
-    oil_ids = [car.oil_tank_id for car in cars]
-    if len(oil_ids) != len(set(oil_ids)):
-        raise RuntimeError("oil_tank_id values must be unique.")
-    for oil_id in oil_ids:
-        if not re.fullmatch(r"\d{6}", oil_id):
-            raise RuntimeError(f"Invalid oil_tank_id: {oil_id}")
+def write_video_contact_sheets(output_dir: Path, docs_dir: Path) -> None:
+    sheet_dir = docs_dir / "video_contact_sheets"
+    sheet_dir.mkdir(parents=True, exist_ok=True)
+    for video_path in sorted((output_dir / "videos").glob("*.mp4")):
+        cap = cv2.VideoCapture(str(video_path))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
+        if total <= 0:
+            cap.release()
+            continue
+        sample_ids = [
+            0,
+            int(total * 0.15),
+            int(total * 0.30),
+            int(total * 0.45),
+            int(total * 0.60),
+            int(total * 0.75),
+            total - 1,
+        ]
+        frames: list[np.ndarray] = []
+        for frame_id in sample_ids:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            frame = cv2.resize(frame, (320, 180))
+            label = f"{video_path.stem} f={frame_id} t={frame_id / fps:.1f}s"
+            cv2.putText(frame, label, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(frame, label, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+            frames.append(frame)
+        cap.release()
+        if frames:
+            cv2.imwrite(str(sheet_dir / f"{video_path.stem}.jpg"), np.vstack(frames))
 
+
+def validate_outputs(
+    output_dir: Path,
+    cars: list[CarSpec],
+    expected_camera_ids: Iterable[str],
+    require_route_plan: bool = False,
+) -> None:
+    del cars
+    expected_camera_ids = tuple(expected_camera_ids)
     videos = sorted((output_dir / "videos").glob("*.mp4"))
-    if len(videos) != len(CAMERAS):
-        raise RuntimeError(f"Expected {len(CAMERAS)} videos, found {len(videos)}.")
+    video_ids = {video.stem for video in videos}
+    missing_videos = [camera_id for camera_id in expected_camera_ids if camera_id not in video_ids]
+    if missing_videos:
+        raise RuntimeError(f"Missing videos for cameras: {', '.join(missing_videos)}.")
 
     required = [
         output_dir / "metadata" / "cars.csv",
@@ -1206,6 +1599,8 @@ def validate_outputs(output_dir: Path, cars: list[CarSpec]) -> None:
         output_dir / "metadata" / "events.jsonl",
         output_dir / "annotations" / "bboxes.jsonl",
     ]
+    if require_route_plan:
+        required.append(output_dir / "metadata" / "route_plan.json")
     for path in required:
         if not path.exists() or path.stat().st_size == 0:
             raise RuntimeError(f"Missing or empty output: {path}")
@@ -1223,9 +1618,11 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     docs_dir = Path(args.docs_dir)
     paths = ensure_dirs(output_dir, docs_dir, args.clean)
-    cars = make_cars(args.num_cars, args.oil_start)
+    cars = make_cars(args.num_cars, args.random_seed)
+    cameras_to_render = selected_cameras(args.camera_ids)
 
     if args.renderer == "carla":
+        log_step("Selected cameras: " + ", ".join(camera.camera_id for camera in cameras_to_render))
         carla_version = render_carla(
             paths,
             cars,
@@ -1235,6 +1632,10 @@ def main() -> int:
             args.duration_sec,
             args.width,
             args.height,
+            args.carla_map,
+            args.carla_timeout_sec,
+            cameras_to_render,
+            args.append_annotations,
         )
         print(f"Generated CARLA 3D CCTV videos with CARLA {carla_version}.")
     else:
@@ -1246,7 +1647,15 @@ def main() -> int:
 
     draw_map_png(docs_dir / "carla_honda_poc_map.png")
     write_dataset_doc(docs_dir / "carla_honda_poc_dataset.md", output_dir)
-    validate_outputs(output_dir, cars)
+    validate_outputs(
+        output_dir,
+        cars,
+        [camera.camera_id for camera in cameras_to_render],
+        require_route_plan=args.renderer == "carla",
+    )
+    if args.write_contact_sheets:
+        write_video_contact_sheets(output_dir, docs_dir)
+        print(f"Contact sheets written to {docs_dir / 'video_contact_sheets'}")
 
     print(f"Generated {len(CAMERAS)} videos for {len(cars)} cars in {output_dir}")
     print(f"Map written to {docs_dir / 'carla_honda_poc_map.png'}")

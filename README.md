@@ -17,7 +17,7 @@ Synthetic video dataset generator สำหรับทำ POC ระบบ **Ho
 Pipeline ของ dataset:
 
 ```text
-Start OCR Camera
+Start Camera
   -> Transit Camera
   -> Junction Status Camera
       -> Good Route Camera
@@ -28,13 +28,12 @@ Start OCR Camera
 
 สิ่งที่ dataset ต้องรองรับ:
 
-- อ่าน `oil_tank_id` จากป้ายกระดาษเลข 6 หลักบนกระจกหน้ารถ
 - track รถข้ามกล้องหลายตัว
 - จำแนกสถานะรถจากทางแยก
   - เลี้ยวซ้าย = `GOOD`
   - เลี้ยวขวา = `DEFECT`
 - ระบุ parking slot สุดท้าย เช่น `G01`, `G02`, `D01`
-- มี metadata สำหรับ validate detector/tracker/OCR/parking logic
+- มี metadata สำหรับ validate detector/tracker/status/parking logic
 
 ---
 
@@ -69,7 +68,7 @@ Dataset ใช้กล้อง fixed CCTV ทั้งหมด 7 ตัว
 
 | Camera ID | Purpose |
 |---|---|
-| `CAM_01_START_OCR` | จุดเริ่มต้น อ่านเลข `oil_tank_id` 6 หลักบนกระจกหน้ารถ |
+| `CAM_01_START` | จุดเริ่มต้น ตรวจจับรถที่ออกจากไลน์ผลิต |
 | `CAM_02_TRANSIT` | เส้นทางหลังออกจาก start ใช้ทดสอบ cross-camera tracking |
 | `CAM_03_JUNCTION_STATUS` | ทางแยกสำหรับจำแนกสถานะรถ |
 | `CAM_04_GOOD_ROUTE` | เส้นทางหลังแยกของรถสถานะ `GOOD` |
@@ -80,7 +79,6 @@ Dataset ใช้กล้อง fixed CCTV ทั้งหมด 7 ตัว
 ### Vehicle Identity
 
 - `tracking_id`: internal tracking ID เช่น `TRK_0001`
-- `oil_tank_id`: เลขล้วน 6 หลัก เช่น `100001`
 - `status`: `GOOD` หรือ `DEFECT`
 - `parking_slot_id`: slot ปลายทาง เช่น `G01` หรือ `D01`
 
@@ -89,14 +87,14 @@ Dataset ใช้กล้อง fixed CCTV ทั้งหมด 7 ตัว
 เมื่อใช้ `--renderer carla` script จะ:
 
 - เชื่อมต่อ CARLA server ที่ `127.0.0.1:2000`
-- โหลด map `Town05`
+- โหลด map `Town05_Opt` และ fallback เป็น `Town05` ถ้า `_Opt` ไม่มี
 - เปิด synchronous mode
 - ตั้ง `fixed_delta_seconds = 1 / fps`
 - spawn รถเป็น CARLA vehicle actors
 - spawn กล้องเป็น fixed `sensor.camera.rgb` actors
 - render วิดีโอจาก sensor จริงของ CARLA
 - project 3D vehicle bounding box ลงบนภาพ 2D
-- overlay ป้าย `oil_tank_id` 6 หลักบริเวณกระจกหน้ารถสำหรับกล้อง OCR
+- OCR ถูกปิดไว้ในรอบ POC นี้ เพื่อโฟกัส vehicle tracking และ parking ก่อน
 
 ---
 
@@ -107,7 +105,7 @@ Dataset ใช้กล้อง fixed CCTV ทั้งหมด 7 ตัว
 ```text
 datasets/carla_honda_poc/
 ├── videos/
-│   ├── CAM_01_START_OCR.mp4
+│   ├── CAM_01_START.mp4
 │   ├── CAM_02_TRANSIT.mp4
 │   ├── CAM_03_JUNCTION_STATUS.mp4
 │   ├── CAM_04_GOOD_ROUTE.mp4
@@ -117,6 +115,7 @@ datasets/carla_honda_poc/
 ├── metadata/
 │   ├── cars.csv
 │   ├── camera_graph.json
+│   ├── route_plan.json  # CARLA renderer
 │   └── events.jsonl
 └── annotations/
     └── bboxes.jsonl
@@ -134,14 +133,12 @@ docs/carla_honda_poc_dataset.md
 `annotations/bboxes.jsonl` มีข้อมูลต่อ frame เช่น:
 
 - `tracking_id`
-- `oil_tank_id`
 - `status`
 - `camera_id`
 - `frame_id`
 - `timestamp_sec`
 - `bbox`
 - `bbox_source`
-- `ocr_bbox`
 - `parking_slot_id`
 - `vehicle_actor_id`
 - `camera_transform`
@@ -219,11 +216,15 @@ docker pull carlasim/carla:0.9.15
 
 ```bash
 docker run --rm --gpus all \
-  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
   nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 ```
 
 ถ้าคำสั่งนี้ไม่ผ่าน ให้แก้ NVIDIA Container Toolkit หรือ driver ก่อน
+
+หมายเหตุ: บน VM/headless server บางเครื่องจะไม่มี `/dev/nvidia-modeset`
+ให้หลีกเลี่ยง capability `display` เพราะ NVIDIA runtime จะพยายาม mount device นี้
+และทำให้ Docker fail ตั้งแต่ container init
 
 ---
 
@@ -236,9 +237,9 @@ docker run --rm -it \
   --privileged \
   --gpus '"device=0"' \
   --net=host \
-  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
   carlasim/carla:0.9.15 \
-  /bin/bash ./CarlaUE4.sh -RenderOffScreen -quality-level=Low -carla-rpc-port=2000
+  /bin/bash ./CarlaUE4.sh -RenderOffScreen -quality-level=Low -carla-rpc-port=2000 -nosound -NoSound
 ```
 
 ใช้ `-RenderOffScreen` สำหรับ VM/headless server
@@ -268,12 +269,12 @@ client.set_timeout(10.0)
 print("client:", client.get_client_version())
 print("server:", client.get_server_version())
 
-world = client.load_world("Town05")
+world = client.load_world("Town05_Opt")
 print("map:", world.get_map().name)
 PY
 ```
 
-ต้องเห็นว่าโหลด `Town05` ได้สำเร็จ
+ต้องเห็นว่าโหลด `Town05_Opt` ได้สำเร็จ ถ้า image ไม่มี `_Opt` ให้ใช้ `Town05`
 
 ---
 
@@ -289,12 +290,12 @@ python scripts/generate_carla_dataset.py --renderer carla --clean
 
 ค่า default:
 
-- `num-cars`: 10
 - `fps`: 10
-- `duration-sec`: 45
+- `num-cars`: 6
+- `duration-sec`: 60
 - `width`: 1280
 - `height`: 720
-- `oil-start`: 100001
+- `carla-map`: Town05_Opt
 - `carla-host`: 127.0.0.1
 - `carla-port`: 2000
 
@@ -303,12 +304,12 @@ python scripts/generate_carla_dataset.py --renderer carla --clean
 ```bash
 python scripts/generate_carla_dataset.py \
   --renderer carla \
-  --num-cars 12 \
+  --num-cars 6 \
   --fps 10 \
   --duration-sec 60 \
   --width 1280 \
   --height 720 \
-  --oil-start 100001 \
+  --write-contact-sheets \
   --clean
 ```
 
@@ -335,14 +336,19 @@ Options:
 | `--output-dir` | `datasets/carla_honda_poc` | output directory |
 | `--docs-dir` | `docs` | directory สำหรับ map/doc generated files |
 | `--renderer` | `storyboard` | `carla` สำหรับ final dataset, `storyboard` สำหรับ dry-run |
-| `--num-cars` | `10` | จำนวนรถ ต้องอยู่ระหว่าง 8-12 |
+| `--num-cars` | `6` | จำนวนรถ ต้องอยู่ระหว่าง 5-6 |
 | `--fps` | `10` | frame rate ของ video output |
-| `--duration-sec` | `45` | ความยาววิดีโอต่อกล้อง |
+| `--duration-sec` | `60` | ความยาววิดีโอต่อกล้อง |
 | `--width` | `1280` | video width |
 | `--height` | `720` | video height |
-| `--oil-start` | `100001` | เลขเริ่มต้นของ oil tank ID |
 | `--carla-host` | `127.0.0.1` | CARLA server host |
 | `--carla-port` | `2000` | CARLA RPC port |
+| `--carla-map` | `Town05_Opt` | CARLA map ที่ใช้สร้าง POC; fallback เป็น `Town05` ถ้า `_Opt` ไม่มี |
+| `--carla-timeout-sec` | `120` | timeout สำหรับ CARLA RPC เช่น load/get world บน server ที่โหลดช้า |
+| `--random-seed` | `7` | seed สำหรับ start delay แบบ deterministic |
+| `--camera-ids` | all | comma-separated camera IDs สำหรับ render เฉพาะบางกล้อง เช่น resume หลัง CARLA crash |
+| `--append-annotations` | off | append `annotations/bboxes.jsonl` แทนการเขียนใหม่ ใช้คู่กับ `--camera-ids` ตอน resume |
+| `--write-contact-sheets` | off | สร้างภาพ sample frames ต่อกล้องไว้ที่ `docs/video_contact_sheets/` สำหรับตรวจมุมกล้อง |
 | `--clean` | off | ลบ output directory เดิมก่อนสร้างใหม่ |
 
 ---
@@ -370,22 +376,6 @@ for path in sorted(Path("datasets/carla_honda_poc/videos").glob("*.mp4")):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
     print(path.name, frames, fps, f"{width}x{height}")
-PY
-```
-
-เช็ก oil tank ID:
-
-```bash
-python - <<'PY'
-import csv
-import re
-
-with open("datasets/carla_honda_poc/metadata/cars.csv") as fh:
-    cars = list(csv.DictReader(fh))
-
-assert all(re.fullmatch(r"\d{6}", car["oil_tank_id"]) for car in cars)
-assert len({car["oil_tank_id"] for car in cars}) == len(cars)
-print("oil_tank_id validation ok:", [car["oil_tank_id"] for car in cars])
 PY
 ```
 
@@ -427,6 +417,7 @@ pip install carla==0.9.15
 ### Docker error: `/dev/nvidia-modeset: no such file or directory`
 
 แปลว่า host มี NVIDIA compute device แต่ graphics stack ยังไม่ครบสำหรับ CARLA rendering
+หรือ Docker command ขอ `NVIDIA_DRIVER_CAPABILITIES=display` บนเครื่อง headless ที่ไม่มี display device
 
 เช็ก:
 
@@ -445,6 +436,23 @@ nvidia_modeset
 nvidia_drm
 ```
 
+ถ้าใช้ VM/headless server และคำสั่งนี้ผ่าน:
+
+```bash
+docker run --rm --gpus all \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+  nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+```
+
+ให้รัน CARLA โดยไม่ใส่ `display`:
+
+```bash
+-e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+```
+
+ถ้ายังต้องใช้ `display` จริง ๆ ต้องแก้ driver/module ฝั่ง host ให้มี `/dev/nvidia-modeset`
+ก่อน ไม่ใช่แก้ใน container
+
 บน Debian ต้องเปิด repo `non-free non-free-firmware` ก่อนติดตั้ง driver:
 
 ```text
@@ -461,6 +469,64 @@ sudo apt install -y linux-headers-amd64 build-essential dkms
 sudo apt install -y nvidia-driver firmware-misc-nonfree libvulkan1 vulkan-tools
 sudo reboot
 ```
+
+### CARLA error: `xdg-user-dir: not found`
+
+CARLA Docker image อาจไม่มี `xdg-user-dir` ทำให้ Unreal Engine หยุดตั้งแต่เริ่ม
+ให้ทดสอบด้วย wrapper ที่สร้าง fallback command ให้ container:
+
+```bash
+docker run --rm -it \
+  --privileged \
+  --gpus '"device=0"' \
+  --net=host \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+  --entrypoint /bin/bash \
+  carlasim/carla:0.9.15 \
+  -lc 'mkdir -p /tmp/carla-bin;
+       printf '"'"'#!/bin/sh\nprintf "%s\\n" "${HOME:-/home/carla}"\n'"'"' > /tmp/carla-bin/xdg-user-dir;
+       chmod +x /tmp/carla-bin/xdg-user-dir;
+       export PATH=/tmp/carla-bin:$PATH;
+       ./CarlaUE4.sh -RenderOffScreen -quality-level=Low -carla-rpc-port=2000 -nosound -NoSound'
+```
+
+บน headless server ให้ใส่ `-nosound -NoSound` เสมอ เพราะ Unreal Engine อาจ crash
+หลัง ALSA หา default audio device ไม่เจอ
+
+ถ้ายัง exit ทันที ให้เช็ก Vulkan/NVIDIA userspace libs ใน container:
+
+```bash
+docker run --rm --gpus '"device=0"' \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+  --entrypoint /bin/bash \
+  carlasim/carla:0.9.15 \
+  -lc 'ls -l /etc/vulkan/icd.d;
+       ls -l /usr/lib/x86_64-linux-gnu/libGLX_nvidia.so* 2>/dev/null || true'
+```
+
+ถ้าไม่มี `libGLX_nvidia.so.0` หรือ `vulkaninfo` รายงาน
+`VK_ERROR_INCOMPATIBLE_DRIVER` แปลว่า host มี NVIDIA compute driver
+แต่ยังไม่มี NVIDIA OpenGL/Vulkan userspace libraries ที่ CARLA ต้องใช้
+ต้องติดตั้ง NVIDIA driver/GL/Vulkan package ฝั่ง host ให้ครบและ version ตรงกับ kernel driver
+ก่อน ไม่ใช่แก้เฉพาะใน container
+
+ถ้า `nvidia-smi` ขึ้น `driver/library version mismatch` หลังติดตั้ง driver:
+
+```text
+Failed to initialize NVML: Driver/library version mismatch
+NVML library version: 550.163
+```
+
+ให้เช็ก kernel module ที่กำลังรัน:
+
+```bash
+cat /proc/driver/nvidia/version
+dpkg -l | grep -E 'nvidia-driver|libnvidia-ml1|nvidia-vulkan-icd'
+```
+
+ถ้า kernel module เป็นคนละ version กับ package เช่น kernel ยังเป็น `580.x`
+แต่ package เป็น `550.x` ต้อง reboot ให้ kernel โหลด module version ใหม่
+หลังจากแก้ `modprobe/depmod` ให้เป็นของจริงก่อน
 
 ### `apt update` fail เพราะ NVIDIA mirror 404
 
@@ -516,11 +582,15 @@ ss -lntp | grep 2000
 | `carla` | final dataset | 3D CCTV render จาก CARLA RGB sensors |
 | `storyboard` | dry-run/debug | ภาพ 2D schematic สำหรับเช็ก metadata เท่านั้น |
 
-### Why Projected Overlay For Oil Tank ID?
+### Custom Map Phase
 
-รอบ POC ใช้วิธี overlay เลข 6 หลักลงบนบริเวณกระจกหน้ารถ เพื่อควบคุม OCR target ให้ชัดและ reproducible โดยยังคงใช้ฉาก รถ และกล้องจาก CARLA 3D จริง
+รอบนี้ใช้ `Town05_Opt`/`Town05` เป็น Hybrid POC ก่อน เพราะมี road network และ carpark ที่พร้อมใช้งานใน CARLA package
 
-ถ้าต้องการความสมจริงสูงขึ้นในอนาคต สามารถต่อยอดเป็น custom Unreal/CARLA asset สำหรับป้ายกระดาษจริงได้
+ถ้าต้องการ map ที่ตรงกับ `docs/carla_honda_poc_map.png` แบบ 1:1 ต้องสร้าง custom map ด้วย RoadRunner หรือเครื่องมือ OpenDRIVE/FBX อื่น แล้ว import เข้า CARLA:
+
+- CARLA custom map ต้องมี geometry `.fbx` และ OpenDRIVE `.xodr`
+- RoadRunner สามารถ export เป็น CARLA format ได้
+- ถ้าใช้ CARLA binary/Docker ต้อง ingest map package แยกก่อนนำมาใช้จริง
 
 ---
 
@@ -531,4 +601,3 @@ ss -lntp | grep 2000
 - CARLA sensors reference: https://carla.readthedocs.io/en/0.9.15/ref_sensors/
 - CARLA rendering options: https://carla.readthedocs.io/en/0.9.15/adv_rendering_options/
 - Debian NVIDIA driver guide: https://wiki.debian.org/NvidiaGraphicsDrivers
-
