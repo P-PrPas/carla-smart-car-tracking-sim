@@ -979,8 +979,8 @@ def build_camera_transforms(carla, route: CarlaRoute) -> dict[str, object]:
     good_last = len(route.good) - 1
     defect_last = len(route.defect) - 1
 
-    targets["CAM_02_TRANSIT"] = route.common[min(20, common_last)].location
-    look_targets["CAM_02_TRANSIT"] = route.common[min(26, common_last)].location
+    targets["CAM_02_TRANSIT"] = route.common[min(12, common_last)].location
+    look_targets["CAM_02_TRANSIT"] = route.common[min(16, common_last)].location
     targets["CAM_03_JUNCTION_STATUS"] = route.common[common_last].location
     look_targets["CAM_03_JUNCTION_STATUS"] = average_locations(
         carla,
@@ -994,7 +994,7 @@ def build_camera_transforms(carla, route: CarlaRoute) -> dict[str, object]:
 
     yaw_by_camera = {
         "CAM_01_START": route.common[min(3, len(route.common) - 1)].rotation.yaw,
-        "CAM_02_TRANSIT": route.common[min(20, len(route.common) - 1)].rotation.yaw,
+        "CAM_02_TRANSIT": route.common[min(12, len(route.common) - 1)].rotation.yaw,
         "CAM_03_JUNCTION_STATUS": route.common[-1].rotation.yaw,
         "CAM_04_GOOD_ROUTE": route.good[min(10, len(route.good) - 1)].rotation.yaw,
         "CAM_05_DEFECT_ROUTE": route.defect[min(10, len(route.defect) - 1)].rotation.yaw,
@@ -1003,7 +1003,7 @@ def build_camera_transforms(carla, route: CarlaRoute) -> dict[str, object]:
     }
     camera_plan = {
         "CAM_01_START": {"yaw_offset": -125.0, "distance": 18.0, "height": 9.0},
-        "CAM_02_TRANSIT": {"yaw_offset": 96.0, "distance": 28.0, "height": 14.0},
+        "CAM_02_TRANSIT": {"yaw_offset": -160.0, "distance": 22.0, "height": 13.0},
         "CAM_03_JUNCTION_STATUS": {"yaw_offset": -48.0, "distance": 30.0, "height": 17.0},
         "CAM_04_GOOD_ROUTE": {"yaw_offset": -82.0, "distance": 20.0, "height": 13.0},
         "CAM_05_DEFECT_ROUTE": {"yaw_offset": 82.0, "distance": 20.0, "height": 13.0},
@@ -1030,7 +1030,7 @@ def build_camera_transforms(carla, route: CarlaRoute) -> dict[str, object]:
 def carla_camera_fovs() -> dict[str, float]:
     return {
         camera.camera_id: {
-            "CAM_02_TRANSIT": 74.0,
+            "CAM_02_TRANSIT": 78.0,
             "CAM_03_JUNCTION_STATUS": 66.0,
             "CAM_06_GOOD_PARKING": 72.0,
         }.get(camera.camera_id, 85.0)
@@ -1316,8 +1316,8 @@ def hide_camera_blockers(carla, world: object, route: CarlaRoute, camera_transfo
     blocker_segments = (
         (
             camera_transforms["CAM_02_TRANSIT"].location,
-            route.common[min(26, len(route.common) - 1)].location,
-            14.0,
+            route.common[min(16, len(route.common) - 1)].location,
+            10.0,
         ),
         (
             camera_transforms["CAM_03_JUNCTION_STATUS"].location,
