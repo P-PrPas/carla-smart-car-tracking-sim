@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -84,13 +85,55 @@ class TileSpec:
 
 
 LAYOUT_1080P = {
-    "CAM_01_START": TileSpec("CAM_01_START", 48, 128, 420, 236),
-    "CAM_02_TRANSIT": TileSpec("CAM_02_TRANSIT", 48, 606, 420, 236),
-    "CAM_03_JUNCTION_STATUS": TileSpec("CAM_03_JUNCTION_STATUS", 552, 360, 500, 281),
-    "CAM_04_GOOD_ROUTE": TileSpec("CAM_04_GOOD_ROUTE", 1132, 128, 342, 192),
-    "CAM_06_GOOD_PARKING": TileSpec("CAM_06_GOOD_PARKING", 1530, 128, 342, 192),
-    "CAM_05_DEFECT_ROUTE": TileSpec("CAM_05_DEFECT_ROUTE", 1132, 650, 342, 192),
-    "CAM_07_DEFECT_PARKING": TileSpec("CAM_07_DEFECT_PARKING", 1530, 650, 342, 192),
+    "CAM_02_TRANSIT": TileSpec("CAM_02_TRANSIT", 72, 170, 344, 194),
+    "CAM_01_START": TileSpec("CAM_01_START", 218, 626, 344, 194),
+    "CAM_03_JUNCTION_STATUS": TileSpec("CAM_03_JUNCTION_STATUS", 730, 380, 374, 210),
+    "CAM_05_DEFECT_ROUTE": TileSpec("CAM_05_DEFECT_ROUTE", 1198, 116, 344, 194),
+    "CAM_07_DEFECT_PARKING": TileSpec("CAM_07_DEFECT_PARKING", 1530, 118, 344, 194),
+    "CAM_04_GOOD_ROUTE": TileSpec("CAM_04_GOOD_ROUTE", 1180, 696, 344, 194),
+    "CAM_06_GOOD_PARKING": TileSpec("CAM_06_GOOD_PARKING", 1530, 690, 344, 194),
+}
+
+MAP_POINTS = {
+    "CAM_01_START": (168, 720),
+    "CAM_02_TRANSIT": (505, 426),
+    "CAM_03_JUNCTION_STATUS": (855, 640),
+    "CAM_04_GOOD_ROUTE": (1115, 792),
+    "CAM_06_GOOD_PARKING": (1658, 875),
+    "CAM_05_DEFECT_ROUTE": (1168, 275),
+    "CAM_07_DEFECT_PARKING": (1530, 418),
+}
+
+ROUTE_PATHS = {
+    "common": [
+        MAP_POINTS["CAM_01_START"],
+        (255, 672),
+        (340, 545),
+        MAP_POINTS["CAM_02_TRANSIT"],
+        (626, 454),
+        (735, 552),
+        MAP_POINTS["CAM_03_JUNCTION_STATUS"],
+    ],
+    "good": [
+        MAP_POINTS["CAM_03_JUNCTION_STATUS"],
+        MAP_POINTS["CAM_04_GOOD_ROUTE"],
+        (1325, 878),
+        MAP_POINTS["CAM_06_GOOD_PARKING"],
+    ],
+    "defect": [
+        MAP_POINTS["CAM_03_JUNCTION_STATUS"],
+        (1000, 520),
+        (1048, 368),
+        MAP_POINTS["CAM_05_DEFECT_ROUTE"],
+        (1320, 482),
+        MAP_POINTS["CAM_07_DEFECT_PARKING"],
+    ],
+}
+
+ROUTE_COLORS = {
+    "common": (255, 142, 46),
+    "good": (88, 255, 114),
+    "defect": (72, 82, 255),
 }
 
 FLOW_EDGES = [
@@ -105,9 +148,9 @@ FLOW_EDGES = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compose seven CCTV camera videos into one monitor-room MP4.")
-    parser.add_argument("--input-dir", default="datasets/carla_honda_poc/videos")
-    parser.add_argument("--output", default="datasets/carla_honda_poc/videos/monitor_room.mp4")
-    parser.add_argument("--metadata-dir", default="datasets/carla_honda_poc/metadata")
+    parser.add_argument("--input-dir", default="datasets/carla_honda_poc_aaa_relight/videos")
+    parser.add_argument("--output", default="datasets/carla_honda_poc_aaa_relight/videos/visual_map_monitor.mp4")
+    parser.add_argument("--metadata-dir", default="datasets/carla_honda_poc_aaa_relight/metadata")
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
     parser.add_argument("--fps", type=float, default=0.0, help="Output FPS. Default uses the first input video FPS.")
@@ -208,41 +251,293 @@ def text_size(text: str, scale: float, thickness: int = 1) -> tuple[int, int]:
     return w, h
 
 
-def draw_background(width: int, height: int) -> np.ndarray:
+def blend_polygon(image: np.ndarray, points: list[tuple[int, int]], color: tuple[int, int, int], alpha: float) -> None:
+    overlay = image.copy()
+    cv2.fillPoly(overlay, [np.array(points, dtype=np.int32)], color, cv2.LINE_AA)
+    cv2.addWeighted(overlay, alpha, image, 1.0 - alpha, 0.0, image)
+
+
+def draw_rotated_rect(
+    image: np.ndarray,
+    center: tuple[int, int],
+    size: tuple[int, int],
+    angle_deg: float,
+    color: tuple[int, int, int],
+    alpha: float,
+    outline: tuple[int, int, int] | None = None,
+) -> None:
+    rect = (center, size, angle_deg)
+    box = cv2.boxPoints(rect).astype(np.int32)
+    overlay = image.copy()
+    cv2.fillPoly(overlay, [box], color, cv2.LINE_AA)
+    cv2.addWeighted(overlay, alpha, image, 1.0 - alpha, 0.0, image)
+    if outline:
+        cv2.polylines(image, [box], True, outline, 1, cv2.LINE_AA)
+
+
+def draw_parking_block(
+    image: np.ndarray,
+    rect: tuple[int, int, int, int],
+    label: str,
+    slot_cols: int,
+    slot_rows: int,
+) -> None:
+    x, y, w, h = rect
+    overlay = image.copy()
+    cv2.rectangle(overlay, (x, y), (x + w, y + h), (34, 42, 44), -1)
+    cv2.addWeighted(overlay, 0.44, image, 0.56, 0.0, image)
+    cv2.rectangle(image, (x, y), (x + w, y + h), (78, 95, 98), 1, cv2.LINE_AA)
+    cv2.rectangle(image, (x + 4, y + 4), (x + w - 4, y + h - 4), (44, 120, 135), 1, cv2.LINE_AA)
+
+    margin_x = max(14, w // 12)
+    margin_y = max(16, h // 12)
+    cell_w = max(10, (w - margin_x * 2) // max(1, slot_cols))
+    cell_h = max(8, (h - margin_y * 2) // max(1, slot_rows))
+    slot_color = (76, 98, 100)
+    car_color = (75, 74, 128)
+    for row_idx in range(slot_rows):
+        for col_idx in range(slot_cols):
+            sx = x + margin_x + col_idx * cell_w
+            sy = y + margin_y + row_idx * cell_h
+            cv2.rectangle(image, (sx, sy), (sx + cell_w - 3, sy + cell_h - 3), slot_color, 1, cv2.LINE_AA)
+            if (row_idx + col_idx) % 3 != 0:
+                cv2.rectangle(
+                    image,
+                    (sx + 3, sy + 3),
+                    (sx + cell_w - 6, sy + max(4, cell_h - 6)),
+                    car_color,
+                    -1,
+                    cv2.LINE_AA,
+                )
+
+    tw, th = text_size(label, 1.25, 2)
+    rounded_rect(
+        image,
+        (x + w // 2 - tw // 2 - 20, y + h // 2 - th // 2 - 18),
+        (x + w // 2 + tw // 2 + 20, y + h // 2 + th // 2 + 18),
+        (20, 23, 25),
+        5,
+    )
+    put_text(image, label, (x + w // 2 - tw // 2, y + h // 2 + th // 2 - 1), 1.25, (232, 235, 232), 2)
+
+
+def blend_polyline(image: np.ndarray, points: list[tuple[int, int]], color: tuple[int, int, int], thickness: int, alpha: float) -> None:
+    overlay = image.copy()
+    cv2.polylines(overlay, [np.array(points, dtype=np.int32)], False, color, thickness, cv2.LINE_AA)
+    cv2.addWeighted(overlay, alpha, image, 1.0 - alpha, 0.0, image)
+
+
+def draw_map_road(image: np.ndarray, points: list[tuple[int, int]]) -> None:
+    curve = catmull_rom_path(points, samples_per_segment=40)
+    blend_polyline(image, curve, (2, 4, 6), 68, 0.30)
+    blend_polyline(image, curve, (42, 48, 49), 52, 0.72)
+    blend_polyline(image, curve, (16, 21, 23), 40, 0.92)
+    blend_polyline(image, curve, (88, 98, 98), 54, 0.12)
+
+    arr = np.array(curve, dtype=np.int32)
+    cv2.polylines(image, [arr], False, (80, 88, 88), 2, cv2.LINE_AA)
+    cv2.polylines(image, [arr], False, (26, 34, 36), 34, cv2.LINE_AA)
+
+
+def draw_zone_label(image: np.ndarray, text: str, origin: tuple[int, int], color: tuple[int, int, int]) -> None:
+    x, y = origin
+    tw, th = text_size(text, 0.42, 1)
+    rounded_rect(image, (x - 12, y - th - 11), (x + tw + 12, y + 10), (8, 12, 14), 5)
+    cv2.rectangle(image, (x - 12, y + 12), (x + tw + 12, y + 14), color, -1)
+    put_text(image, text, (x, y), 0.42, (126, 142, 142), 1)
+
+
+def draw_map_lot(
+    image: np.ndarray,
+    center: tuple[int, int],
+    size: tuple[int, int],
+    angle_deg: float,
+    label: str,
+    accent: tuple[int, int, int],
+) -> None:
+    cx, cy = center
+    w, h = size
+    draw_rotated_rect(image, center, size, angle_deg, (38, 45, 47), 0.58, (74, 88, 88))
+    draw_rotated_rect(image, center, (max(20, w - 18), max(20, h - 18)), angle_deg, (22, 27, 29), 0.30, accent)
+
+    angle = math.radians(angle_deg)
+    right = np.array([math.cos(angle), math.sin(angle)], dtype=np.float32)
+    down = np.array([-math.sin(angle), math.cos(angle)], dtype=np.float32)
+    cols = max(3, w // 36)
+    rows = max(2, h // 30)
+    start = np.array([cx, cy], dtype=np.float32) - right * (cols - 1) * 18 - down * (rows - 1) * 15
+    for row_idx in range(rows):
+        for col_idx in range(cols):
+            p = start + right * col_idx * 36 + down * row_idx * 30
+            draw_rotated_rect(image, (int(p[0]), int(p[1])), (24, 10), angle_deg, (84, 96, 98), 0.34)
+
+    tw, th = text_size(label, 0.48, 1)
+    draw_rotated_rect(image, (cx, cy), (tw + 42, th + 34), angle_deg, (10, 14, 16), 0.78, accent)
+    put_text(image, label, (cx - tw // 2, cy + th // 2), 0.48, (174, 188, 188), 1)
+
+
+def catmull_rom_path(points: list[tuple[int, int]], samples_per_segment: int = 28) -> list[tuple[int, int]]:
+    if len(points) < 2:
+        return points
+    pts = [points[0], *points, points[-1]]
+    curve: list[tuple[int, int]] = []
+    for idx in range(1, len(pts) - 2):
+        p0 = np.array(pts[idx - 1], dtype=np.float32)
+        p1 = np.array(pts[idx], dtype=np.float32)
+        p2 = np.array(pts[idx + 1], dtype=np.float32)
+        p3 = np.array(pts[idx + 2], dtype=np.float32)
+        for step in range(samples_per_segment):
+            t = step / samples_per_segment
+            t2 = t * t
+            t3 = t2 * t
+            point = 0.5 * (
+                (2.0 * p1)
+                + (-p0 + p2) * t
+                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+            )
+            curve.append((int(round(point[0])), int(round(point[1]))))
+    curve.append(points[-1])
+    return curve
+
+
+def draw_polyline_glow(image: np.ndarray, points: list[tuple[int, int]], color: tuple[int, int, int]) -> None:
+    arr = np.array(points, dtype=np.int32)
+    for thickness, alpha in ((34, 0.08), (22, 0.12), (12, 0.20)):
+        overlay = image.copy()
+        cv2.polylines(overlay, [arr], False, color, thickness, cv2.LINE_AA)
+        cv2.addWeighted(overlay, alpha, image, 1.0 - alpha, 0.0, image)
+    cv2.polylines(image, [arr], False, color, 6, cv2.LINE_AA)
+    cv2.polylines(image, [arr], False, (245, 250, 255), 1, cv2.LINE_AA)
+
+
+def draw_dashed_motion(image: np.ndarray, points: list[tuple[int, int]], color: tuple[int, int, int], frame_idx: int) -> None:
+    if len(points) < 2:
+        return
+    dash = 28
+    gap = 30
+    offset = (frame_idx * 3) % (dash + gap)
+    flat: list[tuple[np.ndarray, float]] = []
+    cumulative = 0.0
+    prev = np.array(points[0], dtype=np.float32)
+    flat.append((prev, cumulative))
+    for point in points[1:]:
+        current = np.array(point, dtype=np.float32)
+        cumulative += float(np.linalg.norm(current - prev))
+        flat.append((current, cumulative))
+        prev = current
+
+    total = cumulative
+    if total <= 0:
+        return
+
+    def interp(distance: float) -> tuple[int, int]:
+        distance = max(0.0, min(total, distance))
+        for idx in range(1, len(flat)):
+            p0, d0 = flat[idx - 1]
+            p1, d1 = flat[idx]
+            if d1 >= distance:
+                ratio = 0.0 if d1 == d0 else (distance - d0) / (d1 - d0)
+                p = p0 + (p1 - p0) * ratio
+                return int(round(p[0])), int(round(p[1]))
+        p = flat[-1][0]
+        return int(round(p[0])), int(round(p[1]))
+
+    distance = -offset
+    while distance < total:
+        start = interp(distance)
+        end = interp(distance + dash)
+        cv2.line(image, start, end, (245, 250, 255), 2, cv2.LINE_AA)
+        distance += dash + gap
+
+    for marker_distance in np.arange(90 + offset, total, 190):
+        tip = interp(float(marker_distance))
+        tail = interp(float(marker_distance - 18))
+        cv2.arrowedLine(image, tail, tip, color, 2, cv2.LINE_AA, tipLength=0.55)
+
+
+@lru_cache(maxsize=4)
+def build_background(width: int, height: int) -> np.ndarray:
     y = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None]
-    top = np.array([26, 29, 31], dtype=np.float32)
-    bottom = np.array([14, 16, 18], dtype=np.float32)
+    x = np.linspace(0.0, 1.0, width, dtype=np.float32)[None, :]
+    top = np.array([18, 27, 30], dtype=np.float32)
+    bottom = np.array([5, 8, 11], dtype=np.float32)
     row = top * (1.0 - y) + bottom * y
     image = np.repeat(row[:, None, :], width, axis=1).astype(np.uint8)
 
-    for x in range(0, width, 48):
-        cv2.line(image, (x, 88), (x, height - 58), (35, 38, 40), 1, cv2.LINE_AA)
-    for y_pos in range(112, height - 58, 48):
-        cv2.line(image, (24, y_pos), (width - 24, y_pos), (35, 38, 40), 1, cv2.LINE_AA)
-    cv2.rectangle(image, (0, 0), (width, 88), (20, 22, 24), -1)
-    cv2.rectangle(image, (0, height - 56), (width, height), (20, 22, 24), -1)
+    radial = np.sqrt((x - 0.52) ** 2 + (y - 0.50) ** 2)
+    vignette = np.clip((radial - 0.16) / 0.78, 0.0, 1.0)
+    image = np.clip(image.astype(np.float32) * (1.0 - 0.42 * vignette[:, :, None]), 0, 255).astype(np.uint8)
+
+    rng = np.random.default_rng(12)
+    noise = rng.normal(0, 4, (height, width, 1)).astype(np.float32)
+    image = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    blend_polygon(image, [(0, 120), (430, 104), (250, 1080), (0, 1080)], (12, 50, 34), 0.32)
+    blend_polygon(image, [(1260, 86), (1920, 72), (1920, 1080), (1440, 1020)], (8, 46, 32), 0.30)
+    blend_polygon(image, [(515, 785), (735, 760), (850, 1045), (595, 1080)], (22, 42, 47), 0.38)
+    blend_polygon(image, [(1150, 598), (1775, 570), (1920, 808), (1205, 840)], (15, 35, 42), 0.30)
+
+    for route_name in ("common", "defect", "good"):
+        draw_map_road(image, ROUTE_PATHS[route_name])
+
+    draw_rotated_rect(image, (720, 260), (555, 230), -12, (50, 57, 59), 0.64, (82, 94, 94))
+    draw_rotated_rect(image, (915, 295), (350, 110), -12, (63, 70, 72), 0.46, (92, 104, 104))
+    draw_rotated_rect(image, (585, 665), (520, 160), -7, (48, 55, 57), 0.58, (78, 90, 90))
+    draw_rotated_rect(image, (1390, 560), (460, 150), -15, (47, 54, 57), 0.46, (76, 90, 90))
+    draw_rotated_rect(image, (1490, 946), (520, 115), 5, (38, 46, 50), 0.42, (68, 82, 84))
+
+    draw_map_lot(image, (1456, 390), (260, 178), -3, "HOLDING AREA", ROUTE_COLORS["defect"])
+    draw_map_lot(image, (1410, 826), (290, 172), 5, "GOOD STORAGE", ROUTE_COLORS["good"])
+
+    draw_zone_label(image, "ENTRY ROAD", (180, 620), ROUTE_COLORS["common"])
+    draw_zone_label(image, "TRANSIT CURVE", (440, 350), ROUTE_COLORS["common"])
+    draw_zone_label(image, "INSPECTION JUNCTION", (760, 326), CAMERA_COLORS["CAM_03_JUNCTION_STATUS"])
+    draw_zone_label(image, "GOOD FLOW", (1018, 882), ROUTE_COLORS["good"])
+    draw_zone_label(image, "HOLD FLOW", (1035, 242), ROUTE_COLORS["defect"])
+
+    for lx, ly in MAP_POINTS.values():
+        overlay = image.copy()
+        cv2.circle(overlay, (lx, ly), 86, (112, 126, 126), -1, cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.045, image, 0.955, 0.0, image)
+
+    for x_pos in range(-80, width + 120, 84):
+        cv2.line(image, (x_pos, 80), (x_pos - 260, height), (25, 34, 36), 1, cv2.LINE_AA)
+    for y_pos in range(120, height + 60, 76):
+        cv2.line(image, (0, y_pos), (width, y_pos - 210), (22, 31, 33), 1, cv2.LINE_AA)
+
+    cv2.rectangle(image, (0, 0), (width, 56), (6, 8, 12), -1)
+    cv2.line(image, (0, 56), (width, 56), (35, 44, 48), 1, cv2.LINE_AA)
+
+    overlay = image.copy()
+    cv2.rectangle(overlay, (0, 56), (width, height), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.20, image, 0.80, 0.0, image)
     return image
 
 
+def draw_background(width: int, height: int) -> np.ndarray:
+    return build_background(width, height).copy()
+
+
 def draw_header(canvas: np.ndarray, frame_idx: int, fps: float, metadata: dict[str, object], show_frame_id: bool) -> None:
-    title = "HONDA SMART CAR TRACKING  |  CCTV MONITOR ROOM"
-    put_text(canvas, title, (42, 42), 0.78, (235, 238, 238), 2)
-    subtitle = "Flow: CAM01 -> CAM02 -> CAM03 -> GOOD(CAM04->CAM06) / DEFECT(CAM05->CAM07)"
-    put_text(canvas, subtitle, (42, 70), 0.46, (150, 162, 162), 1)
+    put_text(canvas, "HONDA", (28, 38), 0.78, (38, 58, 245), 2)
+    cv2.line(canvas, (178, 16), (178, 42), (70, 78, 84), 1, cv2.LINE_AA)
+    put_text(canvas, "Honda Vehicle Visual Map Monitor", (198, 38), 0.64, (238, 242, 242), 1)
 
     timestamp = frame_idx / fps if fps else 0.0
     label = f"T+{timestamp:05.1f}s"
     if show_frame_id:
         label += f"   FRAME {frame_idx:05d}"
-    w, _ = text_size(label, 0.62, 2)
-    rounded_rect(canvas, (canvas.shape[1] - w - 76, 24), (canvas.shape[1] - 40, 64), (42, 48, 50), 8)
-    put_text(canvas, label, (canvas.shape[1] - w - 58, 51), 0.62, (235, 238, 238), 2)
+    put_text(canvas, "LIVE", (canvas.shape[1] - 344, 36), 0.48, (45, 65, 255), 2)
+    cv2.circle(canvas, (canvas.shape[1] - 360, 28), 6, (45, 65, 255), -1, cv2.LINE_AA)
+    w, _ = text_size(label, 0.48, 1)
+    put_text(canvas, label, (canvas.shape[1] - w - 30, 36), 0.48, (210, 214, 214), 1)
 
     carla_map = metadata.get("carla_map") or metadata.get("map") or ""
     if isinstance(metadata.get("cameras"), list):
         carla_map = metadata.get("carla_map", carla_map)
     if carla_map:
-        put_text(canvas, str(carla_map), (canvas.shape[1] - 320, 78), 0.42, (130, 140, 140), 1)
+        put_text(canvas, str(carla_map), (30, 82), 0.36, (108, 124, 126), 1)
 
 
 def draw_arrow(
@@ -265,21 +560,57 @@ def draw_arrow(
     put_text(canvas, label, (mid[0] - tw // 2, mid[1] + th // 2 - 1), 0.42, (232, 235, 232), 1)
 
 
-def draw_flow(canvas: np.ndarray) -> None:
-    layout = LAYOUT_1080P
-    edge_points = {
-        ("CAM_01_START", "CAM_02_TRANSIT"): (layout["CAM_01_START"].bottom, layout["CAM_02_TRANSIT"].top),
-        ("CAM_02_TRANSIT", "CAM_03_JUNCTION_STATUS"): (layout["CAM_02_TRANSIT"].right, layout["CAM_03_JUNCTION_STATUS"].left),
-        ("CAM_03_JUNCTION_STATUS", "CAM_04_GOOD_ROUTE"): (layout["CAM_03_JUNCTION_STATUS"].right, layout["CAM_04_GOOD_ROUTE"].left),
-        ("CAM_04_GOOD_ROUTE", "CAM_06_GOOD_PARKING"): (layout["CAM_04_GOOD_ROUTE"].right, layout["CAM_06_GOOD_PARKING"].left),
-        ("CAM_03_JUNCTION_STATUS", "CAM_05_DEFECT_ROUTE"): (layout["CAM_03_JUNCTION_STATUS"].right, layout["CAM_05_DEFECT_ROUTE"].left),
-        ("CAM_05_DEFECT_ROUTE", "CAM_07_DEFECT_PARKING"): (layout["CAM_05_DEFECT_ROUTE"].right, layout["CAM_07_DEFECT_PARKING"].left),
-    }
-    for src, dst, label in FLOW_EDGES:
-        color = (100, 220, 145) if label in {"GOOD", "PARK"} and "GOOD" in dst else CAMERA_COLORS.get(dst, (210, 210, 210))
-        if label == "DEFECT" or "DEFECT" in dst:
-            color = (105, 130, 255)
-        draw_arrow(canvas, *edge_points[(src, dst)], label, color)
+def marker_label(camera_id: str) -> str:
+    return {
+        "CAM_01_START": "C01",
+        "CAM_02_TRANSIT": "C02",
+        "CAM_03_JUNCTION_STATUS": "C03",
+        "CAM_04_GOOD_ROUTE": "C04",
+        "CAM_05_DEFECT_ROUTE": "C05",
+        "CAM_06_GOOD_PARKING": "C06",
+        "CAM_07_DEFECT_PARKING": "C07",
+    }[camera_id]
+
+
+def draw_camera_marker(canvas: np.ndarray, camera_id: str, frame_idx: int) -> None:
+    x, y = MAP_POINTS[camera_id]
+    color = CAMERA_COLORS[camera_id]
+    pulse = 1.0 + 0.08 * math.sin(frame_idx / 8.0)
+    overlay = canvas.copy()
+    cv2.circle(overlay, (x, y), int(25 * pulse), color, -1, cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.22, canvas, 0.78, 0.0, canvas)
+
+    label = marker_label(camera_id)
+    tw, th = text_size(label, 0.44, 2)
+    box1 = (x - tw // 2 - 21, y - th // 2 - 15)
+    box2 = (x + tw // 2 + 21, y + th // 2 + 15)
+    rounded_rect(canvas, box1, box2, (14, 22, 24), 6)
+    rounded_rect(canvas, box1, box2, color, 6, 2)
+    cv2.rectangle(canvas, (box1[0] + 9, y - 8), (box1[0] + 23, y + 6), color, -1)
+    cv2.circle(canvas, (box1[0] + 26, y - 1), 5, color, -1, cv2.LINE_AA)
+    put_text(canvas, label, (x - tw // 2 + 10, y + th // 2 - 1), 0.44, (246, 250, 248), 2)
+
+
+def draw_leader_line(canvas: np.ndarray, camera_id: str) -> None:
+    spec = LAYOUT_1080P[camera_id]
+    marker = MAP_POINTS[camera_id]
+    candidates = [spec.left, spec.right, spec.top, spec.bottom]
+    anchor = min(candidates, key=lambda p: (p[0] - marker[0]) ** 2 + (p[1] - marker[1]) ** 2)
+    color = CAMERA_COLORS[camera_id]
+    overlay = canvas.copy()
+    cv2.line(overlay, marker, anchor, color, 2, cv2.LINE_AA)
+    cv2.addWeighted(overlay, 0.38, canvas, 0.62, 0.0, canvas)
+
+
+def draw_flow(canvas: np.ndarray, frame_idx: int) -> None:
+    for route_name in ("common", "good", "defect"):
+        curve = catmull_rom_path(ROUTE_PATHS[route_name])
+        color = ROUTE_COLORS[route_name]
+        draw_polyline_glow(canvas, curve, color)
+        draw_dashed_motion(canvas, curve, color, frame_idx)
+    for camera_id in CAMERA_IDS:
+        draw_camera_marker(canvas, camera_id, frame_idx)
+        draw_leader_line(canvas, camera_id)
 
 
 def cover_resize(frame: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
@@ -296,35 +627,47 @@ def cover_resize(frame: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
 def draw_tile(canvas: np.ndarray, spec: TileSpec, frame: np.ndarray, frame_idx: int) -> None:
     color = CAMERA_COLORS[spec.camera_id]
     shadow = np.zeros_like(canvas)
-    rounded_rect(shadow, (spec.x - 5, spec.y - 5), (spec.x + spec.w + 5, spec.y + spec.h + 38), (0, 0, 0), 10)
-    cv2.addWeighted(shadow, 0.22, canvas, 1.0, 0.0, canvas)
+    rounded_rect(shadow, (spec.x - 8, spec.y - 8), (spec.x + spec.w + 8, spec.y + spec.h + 34), (0, 0, 0), 8)
+    cv2.addWeighted(shadow, 0.34, canvas, 1.0, 0.0, canvas)
 
-    rounded_rect(canvas, (spec.x - 3, spec.y - 3), (spec.x + spec.w + 3, spec.y + spec.h + 34), (35, 38, 40), 9)
-    rounded_rect(canvas, (spec.x - 3, spec.y - 3), (spec.x + spec.w + 3, spec.y + spec.h + 34), color, 9, 2)
+    rounded_rect(canvas, (spec.x - 3, spec.y - 3), (spec.x + spec.w + 3, spec.y + spec.h + 30), (10, 14, 17), 7)
+    rounded_rect(canvas, (spec.x - 3, spec.y - 3), (spec.x + spec.w + 3, spec.y + spec.h + 30), (112, 128, 132), 7, 1)
+    cv2.line(canvas, (spec.x, spec.y - 3), (spec.x + spec.w, spec.y - 3), color, 2, cv2.LINE_AA)
 
     image = cover_resize(frame, spec.w, spec.h)
+    image = cv2.addWeighted(image, 0.92, np.zeros_like(image), 0.08, 0.0)
     canvas[spec.y : spec.y + spec.h, spec.x : spec.x + spec.w] = image
-    cv2.rectangle(canvas, (spec.x, spec.y), (spec.x + spec.w, spec.y + spec.h), color, 2, cv2.LINE_AA)
+    cv2.rectangle(canvas, (spec.x, spec.y), (spec.x + spec.w, spec.y + spec.h), (90, 105, 108), 1, cv2.LINE_AA)
 
-    header_h = 34
+    header_h = 30
     overlay = canvas.copy()
     cv2.rectangle(overlay, (spec.x, spec.y), (spec.x + spec.w, spec.y + header_h), (8, 10, 11), -1)
-    cv2.addWeighted(overlay, 0.58, canvas, 0.42, 0.0, canvas)
-    cv2.circle(canvas, (spec.x + 18, spec.y + 17), 6, (68, 238, 125), -1, cv2.LINE_AA)
-    put_text(canvas, CAMERA_NAMES[spec.camera_id], (spec.x + 34, spec.y + 23), 0.5, (246, 248, 248), 1)
-    put_text(canvas, "LIVE", (spec.x + spec.w - 52, spec.y + 23), 0.42, (68, 238, 125), 1)
+    cv2.addWeighted(overlay, 0.64, canvas, 0.36, 0.0, canvas)
+    short_name = CAMERA_NAMES[spec.camera_id].replace("CAM ", "C").replace("  ", "_", 1)
+    put_text(canvas, short_name, (spec.x + 12, spec.y + 20), 0.42, color, 2)
+    put_text(canvas, "LIVE", (spec.x + spec.w - 58, spec.y + 20), 0.34, (210, 220, 220), 1)
+    cv2.circle(canvas, (spec.x + spec.w - 14, spec.y + 15), 4, (45, 65, 255), -1, cv2.LINE_AA)
 
-    footer_y = spec.y + spec.h + 23
-    put_text(canvas, CAMERA_SUBTITLES[spec.camera_id], (spec.x + 10, footer_y), 0.45, (180, 188, 188), 1)
-    put_text(canvas, f"f={frame_idx:05d}", (spec.x + spec.w - 96, footer_y), 0.42, (120, 130, 130), 1)
+    footer_y = spec.y + spec.h + 21
+    put_text(canvas, CAMERA_SUBTITLES[spec.camera_id], (spec.x + 10, footer_y), 0.35, (172, 184, 184), 1)
+    put_text(canvas, f"{frame_idx:05d}", (spec.x + spec.w - 62, footer_y), 0.33, (118, 130, 130), 1)
 
 
 def draw_footer(canvas: np.ndarray) -> None:
-    y = canvas.shape[0] - 22
-    put_text(canvas, "monitor layout preserves route continuity; arrows indicate expected cross-camera handoff", (42, y), 0.45, (130, 140, 140), 1)
-    put_text(canvas, "GOOD branch", (1228, y), 0.45, (95, 230, 145), 1)
-    put_text(canvas, "DEFECT branch", (1438, y), 0.45, (110, 135, 255), 1)
-    put_text(canvas, "PARKING", (1670, y), 0.45, (225, 225, 150), 1)
+    x, y, w, h = 38, 874, 380, 140
+    rounded_rect(canvas, (x, y), (x + w, y + h), (8, 12, 15), 8)
+    rounded_rect(canvas, (x, y), (x + w, y + h), (82, 96, 100), 8, 1)
+    legend = [
+        ("COMMON ROUTE", "C01 -> C02 -> C03", ROUTE_COLORS["common"]),
+        ("GOOD ROUTE", "C03 -> C04 -> C06", ROUTE_COLORS["good"]),
+        ("DEFECT ROUTE", "C03 -> C05 -> C07", ROUTE_COLORS["defect"]),
+    ]
+    for idx, (name, route, color) in enumerate(legend):
+        yy = y + 38 + idx * 38
+        cv2.line(canvas, (x + 24, yy), (x + 74, yy), color, 5, cv2.LINE_AA)
+        cv2.line(canvas, (x + 24, yy), (x + 74, yy), (245, 250, 255), 1, cv2.LINE_AA)
+        put_text(canvas, name, (x + 94, yy + 5), 0.38, (230, 236, 236), 1)
+        put_text(canvas, route, (x + 238, yy + 5), 0.36, (172, 184, 184), 1)
 
 
 def compose_frame(
@@ -338,7 +681,7 @@ def compose_frame(
 ) -> np.ndarray:
     canvas = draw_background(width, height)
     draw_header(canvas, frame_idx, fps, metadata, show_frame_id)
-    draw_flow(canvas)
+    draw_flow(canvas, frame_idx)
     for camera_id in CAMERA_IDS:
         draw_tile(canvas, LAYOUT_1080P[camera_id], frames[camera_id], frame_idx)
     draw_footer(canvas)
