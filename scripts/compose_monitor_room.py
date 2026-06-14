@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -84,6 +85,11 @@ class TileSpec:
         return self.x + self.w // 2, self.y + self.h
 
 
+@dataclass(frozen=True)
+class MonitorConfig:
+    show_bboxes: bool = False
+
+
 LAYOUT_1080P = {
     "CAM_02_TRANSIT": TileSpec("CAM_02_TRANSIT", 72, 170, 344, 194),
     "CAM_01_START": TileSpec("CAM_01_START", 218, 626, 344, 194),
@@ -136,6 +142,20 @@ ROUTE_COLORS = {
     "defect": (72, 82, 255),
 }
 
+NEUTRAL_BBOX_COLOR = (235, 210, 120)
+CLASSIFICATION_CAMERA_ID = "CAM_03_JUNCTION_STATUS"
+PRE_CLASSIFICATION_CAMERAS = {"CAM_01_START", "CAM_02_TRANSIT"}
+POST_CLASSIFICATION_CAMERAS = {
+    "CAM_04_GOOD_ROUTE",
+    "CAM_05_DEFECT_ROUTE",
+    "CAM_06_GOOD_PARKING",
+    "CAM_07_DEFECT_PARKING",
+}
+
+CAM3_BASE_SIZE = (374, 210)
+CAM3_GOOD_GATE = [(76, 166), (368, 150), (373, 209), (66, 209)]
+CAM3_DEFECT_GATE = [(0, 38), (92, 50), (104, 158), (0, 192)]
+
 FLOW_EDGES = [
     ("CAM_01_START", "CAM_02_TRANSIT", "START"),
     ("CAM_02_TRANSIT", "CAM_03_JUNCTION_STATUS", "TRANSIT"),
@@ -156,6 +176,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=0.0, help="Output FPS. Default uses the first input video FPS.")
     parser.add_argument("--max-frames", type=int, default=0, help="Optional cap for quick previews.")
     parser.add_argument("--show-frame-id", action="store_true")
+    parser.add_argument("--bbox-mode", choices=("off", "on"), default="off", help="Draw vehicle tracking boxes from annotations.")
+    parser.add_argument("--show-bboxes", action="store_true", help="Shortcut for --bbox-mode on.")
+    parser.add_argument(
+        "--annotations-path",
+        default="",
+        help="Path to bboxes.jsonl. Default: <input dataset>/annotations/bboxes.jsonl.",
+    )
     parser.add_argument("--codec", default="mp4v")
     return parser.parse_args()
 
@@ -206,6 +233,32 @@ def read_camera_graph(metadata_dir: Path) -> dict[str, object]:
             return json.load(fh)
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def default_annotations_path(input_dir: Path) -> Path:
+    return input_dir.parent / "annotations" / "bboxes.jsonl"
+
+
+def read_bbox_index(path: Path) -> dict[tuple[str, int], list[dict[str, object]]]:
+    if not path.exists():
+        raise FileNotFoundError(f"Could not find bbox annotations: {path}")
+
+    index: defaultdict[tuple[str, int], list[dict[str, object]]] = defaultdict(list)
+    with path.open(encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+                camera_id = str(record["camera_id"])
+                frame_id = int(record["frame_id"])
+                bbox = record["bbox"]
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Invalid bbox annotation at {path}:{line_no}") from exc
+            if camera_id not in CAMERA_IDS or not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+            index[(camera_id, frame_id)].append(record)
+    return dict(index)
 
 
 def rounded_rect(
@@ -624,7 +677,169 @@ def cover_resize(frame: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
     return resized[y0 : y0 + target_h, x0 : x0 + target_w]
 
 
-def draw_tile(canvas: np.ndarray, spec: TileSpec, frame: np.ndarray, frame_idx: int) -> None:
+def map_bbox_to_tile(
+    bbox: list[object],
+    src_w: int,
+    src_h: int,
+    target_w: int,
+    target_h: int,
+) -> tuple[int, int, int, int] | None:
+    try:
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+    except (TypeError, ValueError):
+        return None
+
+    scale = max(target_w / src_w, target_h / src_h)
+    resized_w = int(math.ceil(src_w * scale))
+    resized_h = int(math.ceil(src_h * scale))
+    crop_x = max(0, (resized_w - target_w) // 2)
+    crop_y = max(0, (resized_h - target_h) // 2)
+
+    tx1 = int(round(x1 * scale - crop_x))
+    ty1 = int(round(y1 * scale - crop_y))
+    tx2 = int(round(x2 * scale - crop_x))
+    ty2 = int(round(y2 * scale - crop_y))
+    tx1 = max(0, min(target_w - 1, tx1))
+    ty1 = max(0, min(target_h - 1, ty1))
+    tx2 = max(0, min(target_w - 1, tx2))
+    ty2 = max(0, min(target_h - 1, ty2))
+    if tx2 - tx1 < 4 or ty2 - ty1 < 4:
+        return None
+    return tx1, ty1, tx2, ty2
+
+
+def bbox_color(status: str | None) -> tuple[int, int, int]:
+    if status == "GOOD":
+        return ROUTE_COLORS["good"]
+    if status == "DEFECT":
+        return ROUTE_COLORS["defect"]
+    return NEUTRAL_BBOX_COLOR
+
+
+def short_tracking_label(record: dict[str, object], revealed_status: str | None) -> str:
+    tracking_id = str(record.get("tracking_id", "TRK"))
+    suffix = tracking_id.split("_")[-1]
+    if suffix.isdigit():
+        suffix = str(int(suffix))
+    if revealed_status in {"GOOD", "DEFECT"}:
+        return f"ID {suffix} {revealed_status}"
+    return f"ID {suffix}"
+
+
+def scaled_points(points: list[tuple[int, int]], target_w: int, target_h: int) -> list[tuple[int, int]]:
+    base_w, base_h = CAM3_BASE_SIZE
+    return [(int(round(x / base_w * target_w)), int(round(y / base_h * target_h))) for x, y in points]
+
+
+def point_in_polygon(point: tuple[float, float], polygon: list[tuple[int, int]]) -> bool:
+    return cv2.pointPolygonTest(np.array(polygon, dtype=np.int32), point, False) >= 0
+
+
+def revealed_tracking_status(
+    camera_id: str,
+    record: dict[str, object],
+    bbox: tuple[int, int, int, int],
+    target_w: int,
+    target_h: int,
+) -> str | None:
+    status = str(record.get("status", "")).upper()
+    if status not in {"GOOD", "DEFECT"}:
+        return None
+    if camera_id in PRE_CLASSIFICATION_CAMERAS:
+        return None
+    if camera_id in POST_CLASSIFICATION_CAMERAS:
+        return status
+    if camera_id != CLASSIFICATION_CAMERA_ID:
+        return None
+
+    x1, y1, x2, y2 = bbox
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    good_gate = scaled_points(CAM3_GOOD_GATE, target_w, target_h)
+    defect_gate = scaled_points(CAM3_DEFECT_GATE, target_w, target_h)
+    if status == "GOOD" and point_in_polygon((cx, cy), good_gate):
+        return status
+    if status == "DEFECT" and point_in_polygon((cx, cy), defect_gate):
+        return status
+    return None
+
+
+def draw_cam3_decision_zones(image: np.ndarray) -> None:
+    target_h, target_w = image.shape[:2]
+    zones = [
+        ("GOOD EXIT", scaled_points(CAM3_GOOD_GATE, target_w, target_h), ROUTE_COLORS["good"]),
+        ("BAD EXIT", scaled_points(CAM3_DEFECT_GATE, target_w, target_h), ROUTE_COLORS["defect"]),
+    ]
+    for label, points, color in zones:
+        overlay = image.copy()
+        cv2.fillPoly(overlay, [np.array(points, dtype=np.int32)], color, cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.18, image, 0.82, 0.0, image)
+        cv2.polylines(image, [np.array(points, dtype=np.int32)], True, color, 2, cv2.LINE_AA)
+        cv2.polylines(image, [np.array(points, dtype=np.int32)], True, (245, 250, 248), 1, cv2.LINE_AA)
+
+        min_x = min(p[0] for p in points)
+        min_y = min(p[1] for p in points)
+        text_x = max(4, min(target_w - 108, min_x + 6))
+        text_y = max(18, min_y - 6)
+        tw, th = text_size(label, 0.28, 1)
+        rounded_rect(image, (text_x - 4, text_y - th - 6), (text_x + tw + 6, text_y + 4), (8, 12, 14), 4)
+        rounded_rect(image, (text_x - 4, text_y - th - 6), (text_x + tw + 6, text_y + 4), color, 4, 1)
+        put_text(image, label, (text_x, text_y - 2), 0.28, (235, 240, 240), 1)
+
+
+def draw_tracking_bboxes(
+    image: np.ndarray,
+    camera_id: str,
+    records: list[dict[str, object]],
+    src_shape: tuple[int, int],
+    config: MonitorConfig,
+) -> None:
+    src_h, src_w = src_shape
+    target_h, target_w = image.shape[:2]
+    for record in records:
+        bbox = map_bbox_to_tile(record.get("bbox", []), src_w, src_h, target_w, target_h)
+        if bbox is None:
+            continue
+        x1, y1, x2, y2 = bbox
+        revealed_status = revealed_tracking_status(camera_id, record, bbox, target_w, target_h)
+        color = bbox_color(revealed_status)
+
+        overlay = image.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.70, image, 0.30, 0.0, image)
+
+        corner = max(9, min(22, (x2 - x1) // 4, (y2 - y1) // 4))
+        for start, end in (
+            ((x1, y1), (x1 + corner, y1)),
+            ((x1, y1), (x1, y1 + corner)),
+            ((x2, y1), (x2 - corner, y1)),
+            ((x2, y1), (x2, y1 + corner)),
+            ((x1, y2), (x1 + corner, y2)),
+            ((x1, y2), (x1, y2 - corner)),
+            ((x2, y2), (x2 - corner, y2)),
+            ((x2, y2), (x2, y2 - corner)),
+        ):
+            cv2.line(image, start, end, (245, 250, 248), 1, cv2.LINE_AA)
+
+        label = short_tracking_label(record, revealed_status)
+        tw, th = text_size(label, 0.32, 1)
+        label_x = max(0, min(target_w - tw - 10, x1))
+        label_y = y1 - 7 if y1 >= th + 43 else min(target_h - 4, y2 + th + 10)
+        box1 = (label_x, max(0, label_y - th - 8))
+        box2 = (label_x + tw + 10, min(target_h - 1, label_y + 4))
+        rounded_rect(image, box1, box2, (8, 12, 14), 4)
+        rounded_rect(image, box1, box2, color, 4, 1)
+        put_text(image, label, (label_x + 5, label_y - 2), 0.32, (235, 240, 240), 1)
+
+
+def draw_tile(
+    canvas: np.ndarray,
+    spec: TileSpec,
+    frame: np.ndarray,
+    frame_idx: int,
+    bbox_records: list[dict[str, object]],
+    config: MonitorConfig,
+) -> None:
     color = CAMERA_COLORS[spec.camera_id]
     shadow = np.zeros_like(canvas)
     rounded_rect(shadow, (spec.x - 8, spec.y - 8), (spec.x + spec.w + 8, spec.y + spec.h + 34), (0, 0, 0), 8)
@@ -636,6 +851,10 @@ def draw_tile(canvas: np.ndarray, spec: TileSpec, frame: np.ndarray, frame_idx: 
 
     image = cover_resize(frame, spec.w, spec.h)
     image = cv2.addWeighted(image, 0.92, np.zeros_like(image), 0.08, 0.0)
+    if config.show_bboxes and spec.camera_id == CLASSIFICATION_CAMERA_ID:
+        draw_cam3_decision_zones(image)
+    if config.show_bboxes and bbox_records:
+        draw_tracking_bboxes(image, spec.camera_id, bbox_records, frame.shape[:2], config)
     canvas[spec.y : spec.y + spec.h, spec.x : spec.x + spec.w] = image
     cv2.rectangle(canvas, (spec.x, spec.y), (spec.x + spec.w, spec.y + spec.h), (90, 105, 108), 1, cv2.LINE_AA)
 
@@ -672,18 +891,27 @@ def draw_footer(canvas: np.ndarray) -> None:
 
 def compose_frame(
     frames: dict[str, np.ndarray],
+    bbox_index: dict[tuple[str, int], list[dict[str, object]]],
     width: int,
     height: int,
     frame_idx: int,
     fps: float,
     metadata: dict[str, object],
+    config: MonitorConfig,
     show_frame_id: bool,
 ) -> np.ndarray:
     canvas = draw_background(width, height)
     draw_header(canvas, frame_idx, fps, metadata, show_frame_id)
     draw_flow(canvas, frame_idx)
     for camera_id in CAMERA_IDS:
-        draw_tile(canvas, LAYOUT_1080P[camera_id], frames[camera_id], frame_idx)
+        draw_tile(
+            canvas,
+            LAYOUT_1080P[camera_id],
+            frames[camera_id],
+            frame_idx,
+            bbox_index.get((camera_id, frame_idx), []),
+            config,
+        )
     draw_footer(canvas)
     return canvas
 
@@ -697,6 +925,14 @@ def main() -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     captures = open_captures(input_dir)
     metadata = read_camera_graph(Path(args.metadata_dir))
+    config = MonitorConfig(show_bboxes=args.show_bboxes or args.bbox_mode == "on")
+    annotations_path = Path(args.annotations_path) if args.annotations_path else default_annotations_path(input_dir)
+    bbox_index = read_bbox_index(annotations_path) if config.show_bboxes else {}
+    if config.show_bboxes:
+        print(
+            f"[monitor] Loaded bbox annotations: {annotations_path} "
+            f"({sum(len(v) for v in bbox_index.values())} boxes; CARLA depth-visible annotations)"
+        )
 
     first_fps, frame_count = input_video_info(captures)
     output_fps = args.fps if args.fps > 0 else first_fps
@@ -716,7 +952,17 @@ def main() -> int:
                 if not ok:
                     raise RuntimeError(f"Could not read frame {frame_idx} from {camera_id}.")
                 frames[camera_id] = frame
-            canvas = compose_frame(frames, args.width, args.height, frame_idx, output_fps, metadata, args.show_frame_id)
+            canvas = compose_frame(
+                frames,
+                bbox_index,
+                args.width,
+                args.height,
+                frame_idx,
+                output_fps,
+                metadata,
+                config,
+                args.show_frame_id,
+            )
             writer.write(canvas)
             if frame_idx == 0 or (frame_idx + 1) % max(1, int(output_fps) * 5) == 0 or frame_idx + 1 == frame_count:
                 pct = (frame_idx + 1) / frame_count * 100.0

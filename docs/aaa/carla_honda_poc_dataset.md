@@ -17,7 +17,7 @@ logic on machines that do not have CARLA installed.
 - Vehicle spawn cooldown: deterministic random 3-5 seconds
 - Parking behavior: approach, overshoot, reverse entry, correction, final stop
 - Parking lot markings: projected slot lines on parking camera videos
-- Bounding boxes: CARLA 3D vehicle bounding boxes projected into each camera plane
+- Bounding boxes: CARLA 3D vehicle boxes projected into each camera plane, then filtered by matched depth visibility so hidden/occluded vehicles are not annotated
 - OCR is disabled for this POC iteration while vehicle tracking and parking are validated.
 
 ## Generated Files

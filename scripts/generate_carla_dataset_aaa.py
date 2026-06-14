@@ -1133,19 +1133,19 @@ def get_image_point(location: object, intrinsic: np.ndarray, world_to_camera: np
     return float(point_img[0]), float(point_img[1]), float(point_camera[2])
 
 
-def project_actor_bbox(
+def project_actor_bbox_points(
     actor: object,
     camera_transform: object,
     intrinsic: np.ndarray,
     width: int,
     height: int,
-) -> list[int] | None:
+) -> tuple[list[int] | None, list[tuple[float, float, float]]]:
     world_to_camera = np.array(camera_transform.get_inverse_matrix())
     vertices = actor.bounding_box.get_world_vertices(actor.get_transform())
     projected = [get_image_point(vertex, intrinsic, world_to_camera) for vertex in vertices]
     visible = [(x, y) for x, y, depth in projected if depth > 0.0]
     if len(visible) < 4:
-        return None
+        return None, projected
     xs = [point[0] for point in visible]
     ys = [point[1] for point in visible]
     x1 = max(0, int(math.floor(min(xs))))
@@ -1153,10 +1153,164 @@ def project_actor_bbox(
     x2 = min(width - 1, int(math.ceil(max(xs))))
     y2 = min(height - 1, int(math.ceil(max(ys))))
     if x2 <= x1 or y2 <= y1:
-        return None
+        return None, projected
     if x2 < 0 or y2 < 0 or x1 >= width or y1 >= height:
+        return None, projected
+    return [x1, y1, x2, y2], projected
+
+
+def project_actor_bbox(
+    actor: object,
+    camera_transform: object,
+    intrinsic: np.ndarray,
+    width: int,
+    height: int,
+) -> list[int] | None:
+    bbox, _projected = project_actor_bbox_points(actor, camera_transform, intrinsic, width, height)
+    return bbox
+
+
+def depth_image_to_meters(image: object) -> np.ndarray:
+    array = np.frombuffer(image.raw_data, dtype=np.uint8)
+    array = np.reshape(array, (image.height, image.width, 4)).astype(np.float32)
+    # CARLA depth cameras encode normalized depth in RGB; raw_data arrives as BGRA.
+    normalized = (array[:, :, 2] + array[:, :, 1] * 256.0 + array[:, :, 0] * 65536.0) / (256.0**3 - 1.0)
+    return normalized * 1000.0
+
+
+def semantic_image_to_tags(image: object) -> np.ndarray:
+    array = np.frombuffer(image.raw_data, dtype=np.uint8)
+    array = np.reshape(array, (image.height, image.width, 4))
+    # CARLA semantic raw frames encode the class tag in a color channel. Taking the
+    # channel max keeps this robust across BGRA/RGBA channel-order differences.
+    return np.maximum.reduce((array[:, :, 0], array[:, :, 1], array[:, :, 2]))
+
+
+def visible_depth_at(depth_meters: np.ndarray, x: float, y: float, radius: int = 2) -> float | None:
+    height, width = depth_meters.shape[:2]
+    px = int(round(x))
+    py = int(round(y))
+    if px < 0 or px >= width or py < 0 or py >= height:
         return None
-    return [x1, y1, x2, y2]
+    x1 = max(0, px - radius)
+    x2 = min(width, px + radius + 1)
+    y1 = max(0, py - radius)
+    y2 = min(height, py + radius + 1)
+    crop = depth_meters[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+    finite = crop[np.isfinite(crop)]
+    if finite.size == 0:
+        return None
+    return float(np.percentile(finite, 20))
+
+
+def bbox_has_depth_evidence(
+    depth_meters: np.ndarray,
+    bbox: list[int],
+    actor_depth: float,
+    tolerance_m: float,
+) -> float:
+    x1, y1, x2, y2 = bbox
+    crop = depth_meters[y1 : y2 + 1, x1 : x2 + 1]
+    if crop.size == 0:
+        return 0.0
+    stride_y = max(1, crop.shape[0] // 48)
+    stride_x = max(1, crop.shape[1] // 48)
+    sample = crop[::stride_y, ::stride_x]
+    finite = sample[np.isfinite(sample)]
+    if finite.size == 0:
+        return 0.0
+    close = np.abs(finite - actor_depth) <= tolerance_m
+    return float(np.count_nonzero(close) / finite.size)
+
+
+def bbox_has_vehicle_semantic_evidence(semantic_tags: np.ndarray, bbox: list[int]) -> tuple[bool, int, float]:
+    x1, y1, x2, y2 = bbox
+    crop = semantic_tags[y1 : y2 + 1, x1 : x2 + 1]
+    if crop.size == 0:
+        return False, 0, 0.0
+    vehicle_mask = crop == 10  # carla.CityObjectLabel.Vehicles
+    vehicle_pixels = int(np.count_nonzero(vehicle_mask))
+    ratio = float(vehicle_pixels / crop.size)
+    min_pixels = max(8, min(80, int(crop.size * 0.002)))
+    return vehicle_pixels >= min_pixels, vehicle_pixels, ratio
+
+
+def yolo_like_visible_actor_bbox(
+    actor: object,
+    camera_transform: object,
+    intrinsic: np.ndarray,
+    depth_meters: np.ndarray,
+    semantic_tags: np.ndarray | None,
+    width: int,
+    height: int,
+) -> tuple[list[int] | None, dict[str, object]]:
+    bbox, projected = project_actor_bbox_points(actor, camera_transform, intrinsic, width, height)
+    if bbox is None:
+        return None, {"visibility_reject": "projection_outside_view"}
+
+    x1, y1, x2, y2 = bbox
+    box_w = x2 - x1
+    box_h = y2 - y1
+    area = box_w * box_h
+    if box_w < 10 or box_h < 8 or area < 160:
+        return None, {"visibility_reject": "bbox_too_small", "projected_bbox": bbox}
+
+    projected_in_frame = [
+        (x, y, depth)
+        for x, y, depth in projected
+        if depth > 0.0 and 0 <= x < width and 0 <= y < height
+    ]
+    if not projected_in_frame:
+        return None, {"visibility_reject": "no_projected_points_in_frame", "projected_bbox": bbox}
+
+    actor_depth = float(np.median([depth for _x, _y, depth in projected_in_frame]))
+    tolerance_m = max(1.5, actor_depth * 0.06)
+    semantic_visible = False
+    semantic_pixels = 0
+    semantic_ratio = 0.0
+    if semantic_tags is not None:
+        semantic_visible, semantic_pixels, semantic_ratio = bbox_has_vehicle_semantic_evidence(semantic_tags, bbox)
+
+    visible_samples = 0
+    for x, y, actor_point_depth in projected_in_frame:
+        scene_depth = visible_depth_at(depth_meters, x, y)
+        if scene_depth is None:
+            continue
+        if actor_point_depth <= scene_depth + tolerance_m and abs(scene_depth - actor_point_depth) <= tolerance_m * 1.8:
+            visible_samples += 1
+
+    depth_evidence_ratio = bbox_has_depth_evidence(depth_meters, bbox, actor_depth, tolerance_m * 1.5)
+    min_visible_samples = 1 if area < 3000 else 2
+    if not semantic_visible and visible_samples < min_visible_samples and depth_evidence_ratio < 0.015:
+        return None, {
+            "visibility_reject": "semantic_depth_occluded",
+            "projected_bbox": bbox,
+            "semantic_vehicle_pixels": semantic_pixels,
+            "semantic_vehicle_ratio": round(semantic_ratio, 5),
+            "visible_depth_samples": visible_samples,
+            "depth_evidence_ratio": round(depth_evidence_ratio, 5),
+            "actor_depth_m": round(actor_depth, 3),
+        }
+
+    visible_fraction = min(
+        1.0,
+        max(
+            visible_samples / max(1, len(projected_in_frame)),
+            depth_evidence_ratio * 8.0,
+            semantic_ratio * 20.0,
+        ),
+    )
+    return bbox, {
+        "semantic_vehicle_pixels": semantic_pixels,
+        "semantic_vehicle_ratio": round(semantic_ratio, 5),
+        "visible_depth_samples": visible_samples,
+        "projected_points_in_frame": len(projected_in_frame),
+        "depth_evidence_ratio": round(depth_evidence_ratio, 5),
+        "visibility_fraction": round(visible_fraction, 4),
+        "actor_depth_m": round(actor_depth, 3),
+    }
 
 
 def parking_slot_corners(carla, slot_transform: object, length_m: float = 5.8, width_m: float = 2.8) -> list[object]:
@@ -1489,7 +1643,8 @@ def write_carla_route_plan(path: Path, route: CarlaRoute, carla_map: str) -> Non
             "camera_overlap_required": True,
             "parking_final_transform_required": True,
             "parking_lot_markings": "muted worn parking paint and wheel stops on parking cameras",
-            "render_strategy": "one_active_rgb_sensor_per_camera",
+            "render_strategy": "one_active_rgb_sensor_per_camera_with_matched_depth_and_semantic_visibility",
+            "bbox_visibility": "3D projected boxes are written only when matched semantic/depth frames show visible vehicle evidence",
         },
     }
     path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
@@ -1658,7 +1813,14 @@ def spawn_carla_cameras(
     width: int,
     height: int,
     fps: int,
-) -> tuple[dict[str, object], dict[str, queue.Queue]]:
+) -> tuple[
+    dict[str, object],
+    dict[str, queue.Queue],
+    dict[str, object],
+    dict[str, queue.Queue],
+    dict[str, object],
+    dict[str, queue.Queue],
+]:
     blueprint_library = world.get_blueprint_library()
     camera_bp = blueprint_library.find("sensor.camera.rgb")
     camera_bp.set_attribute("image_size_x", str(width))
@@ -1681,16 +1843,43 @@ def spawn_carla_cameras(
         if camera_bp.has_attribute(attr):
             camera_bp.set_attribute(attr, value)
 
+    depth_bp = blueprint_library.find("sensor.camera.depth")
+    depth_bp.set_attribute("image_size_x", str(width))
+    depth_bp.set_attribute("image_size_y", str(height))
+    depth_bp.set_attribute("sensor_tick", str(1.0 / fps))
+
+    semantic_bp = blueprint_library.find("sensor.camera.semantic_segmentation")
+    semantic_bp.set_attribute("image_size_x", str(width))
+    semantic_bp.set_attribute("image_size_y", str(height))
+    semantic_bp.set_attribute("sensor_tick", str(1.0 / fps))
+
     cameras: dict[str, object] = {}
     queues: dict[str, queue.Queue] = {}
+    depth_cameras: dict[str, object] = {}
+    depth_queues: dict[str, queue.Queue] = {}
+    semantic_cameras: dict[str, object] = {}
+    semantic_queues: dict[str, queue.Queue] = {}
     for camera_id, transform in camera_transforms.items():
-        camera_bp.set_attribute("fov", f"{camera_fovs.get(camera_id, 85.0):.1f}")
+        fov = f"{camera_fovs.get(camera_id, 85.0):.1f}"
+        camera_bp.set_attribute("fov", fov)
+        depth_bp.set_attribute("fov", fov)
+        semantic_bp.set_attribute("fov", fov)
         sensor = world.spawn_actor(camera_bp, transform)
         sensor_queue: queue.Queue = queue.Queue()
         sensor.listen(sensor_queue.put)
+        depth_sensor = world.spawn_actor(depth_bp, transform)
+        depth_queue: queue.Queue = queue.Queue()
+        depth_sensor.listen(depth_queue.put)
+        semantic_sensor = world.spawn_actor(semantic_bp, transform)
+        semantic_queue: queue.Queue = queue.Queue()
+        semantic_sensor.listen(semantic_queue.put)
         cameras[camera_id] = sensor
         queues[camera_id] = sensor_queue
-    return cameras, queues
+        depth_cameras[camera_id] = depth_sensor
+        depth_queues[camera_id] = depth_queue
+        semantic_cameras[camera_id] = semantic_sensor
+        semantic_queues[camera_id] = semantic_queue
+    return cameras, queues, depth_cameras, depth_queues, semantic_cameras, semantic_queues
 
 
 def spawn_carla_vehicles(carla, world: object, cars: list[CarSpec], route: CarlaRoute) -> dict[str, object]:
@@ -1890,12 +2079,20 @@ def render_carla(
         bbox_path = paths["annotations"] / "bboxes.jsonl"
 
         projection_records = 0
-        fallback_records = 0
+        depth_filtered_records = 0
+        route_window_records = 0
         bbox_mode = "a" if append_annotations and bbox_path.exists() else "w"
         with bbox_path.open(bbox_mode, encoding="utf-8") as bbox_fh:
             for camera in cameras_to_render:
-                log_step(f"Rendering {camera.camera_id} with one active RGB sensor")
-                camera_actors, camera_queues = spawn_carla_cameras(
+                log_step(f"Rendering {camera.camera_id} with matched RGB/depth/semantic sensors")
+                (
+                    camera_actors,
+                    camera_queues,
+                    depth_actors,
+                    depth_queues,
+                    semantic_actors,
+                    semantic_queues,
+                ) = spawn_carla_cameras(
                     carla,
                     world,
                     {camera.camera_id: camera_transforms[camera.camera_id]},
@@ -1906,11 +2103,19 @@ def render_carla(
                 )
                 camera_actor = camera_actors[camera.camera_id]
                 camera_queue = camera_queues[camera.camera_id]
+                depth_actor = depth_actors[camera.camera_id]
+                depth_queue = depth_queues[camera.camera_id]
+                semantic_actor = semantic_actors[camera.camera_id]
+                semantic_queue = semantic_queues[camera.camera_id]
                 video_path = paths["videos"] / f"{camera.camera_id}.mp4"
                 writer = cv2.VideoWriter(str(video_path), fourcc, fps, (width, height))
                 if not writer.isOpened():
                     camera_actor.stop()
                     camera_actor.destroy()
+                    depth_actor.stop()
+                    depth_actor.destroy()
+                    semantic_actor.stop()
+                    semantic_actor.destroy()
                     raise RuntimeError(f"Could not open video writer: {video_path}")
                 writers[camera.camera_id] = writer
 
@@ -1932,6 +2137,10 @@ def render_carla(
                         world.tick()
                         while not camera_queue.empty():
                             camera_queue.get_nowait()
+                        while not depth_queue.empty():
+                            depth_queue.get_nowait()
+                        while not semantic_queue.empty():
+                            semantic_queue.get_nowait()
                         warmup.update(warmup_frame + 1)
 
                     render_progress = ProgressBar(f"rendering {camera.camera_id}", frame_count)
@@ -1952,6 +2161,8 @@ def render_carla(
                         snapshot = world.tick()
                         sim_frame = snapshot if isinstance(snapshot, int) else snapshot.frame
                         frame = image_to_bgr(get_sensor_frame(camera_queue, sim_frame))
+                        depth_meters = depth_image_to_meters(get_sensor_frame(depth_queue, sim_frame))
+                        semantic_tags = semantic_image_to_tags(get_sensor_frame(semantic_queue, sim_frame))
                         camera_transform = camera_actor.get_transform()
                         if camera.camera_id == "CAM_06_GOOD_PARKING":
                             overlay_projected_parking_lot(
@@ -1969,17 +2180,21 @@ def render_carla(
                             visible_start, visible_end = visible_window
                             if timestamp_sec < visible_start or timestamp_sec > visible_end:
                                 continue
+                            route_window_records += 1
                             actor = vehicle_actors[car.tracking_id]
-                            bbox = project_actor_bbox(actor, camera_transform, intrinsic, width, height)
-                            bbox_source = "carla_3d_projection"
-                            if bbox:
-                                projection_records += 1
-                            else:
-                                bbox = visible_bbox(camera.camera_id, car, timestamp_sec, width, height)
-                                bbox_source = "carla_timing_fallback"
-                                if not bbox:
-                                    continue
-                                fallback_records += 1
+                            bbox, visibility = yolo_like_visible_actor_bbox(
+                                actor,
+                                camera_transform,
+                                intrinsic,
+                                depth_meters,
+                                semantic_tags,
+                                width,
+                                height,
+                            )
+                            if not bbox:
+                                depth_filtered_records += 1
+                                continue
+                            projection_records += 1
                             record = {
                                 "tracking_id": car.tracking_id,
                                 "status": car.status,
@@ -1989,7 +2204,8 @@ def render_carla(
                                 "carla_frame": sim_frame,
                                 "timestamp_sec": round(timestamp_sec, 3),
                                 "bbox": bbox,
-                                "bbox_source": bbox_source,
+                                "bbox_source": "carla_3d_projection_depth_visible",
+                                "visibility": visibility,
                                 "parking_slot_id": car.parking_slot_id if camera.camera_id.endswith("PARKING") else "",
                                 "vehicle_actor_id": actor.id,
                                 "camera_transform": transform_to_dict(camera_transform),
@@ -2019,12 +2235,17 @@ def render_carla(
                     try:
                         camera_actor.stop()
                         camera_actor.destroy()
+                        depth_actor.stop()
+                        depth_actor.destroy()
+                        semantic_actor.stop()
+                        semantic_actor.destroy()
                         world.tick()
                     except RuntimeError:
                         pass
         log_step(
             "Annotation records written: "
-            f"{projection_records} projected, {fallback_records} timing fallback"
+            f"{projection_records} depth-visible projected, "
+            f"{depth_filtered_records} depth-filtered from {route_window_records} route-window candidates"
         )
         if projection_records == 0:
             raise RuntimeError(
@@ -2138,7 +2359,7 @@ logic on machines that do not have CARLA installed.
 - Vehicle spawn cooldown: deterministic random 3-5 seconds
 - Parking behavior: approach, overshoot, reverse entry, correction, final stop
 - Parking lot markings: projected slot lines on parking camera videos
-- Bounding boxes: CARLA 3D vehicle bounding boxes projected into each camera plane
+- Bounding boxes: CARLA 3D vehicle boxes projected into each camera plane, then filtered by matched semantic/depth visibility so hidden/occluded vehicles are not annotated
 - OCR is disabled for this POC iteration while vehicle tracking and parking are validated.
 
 ## Generated Files
