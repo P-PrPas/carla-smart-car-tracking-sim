@@ -467,6 +467,13 @@ value is shown in parentheses).
 
 ## 🗂️ Dataset Outputs & Schemas
 
+> [!IMPORTANT]
+> The `datasets/` directory is **git-ignored and not shipped in this repository** (the videos
+> are multi-GB artifacts). After cloning you will only have code, config, and docs. To obtain the
+> dataset, either **regenerate it** with the [full pipeline](#-quickstart--full-pipeline) against a
+> running CARLA server, or **request the delivered `carla_honda_poc_aaa_relight` bundle** from the
+> handoff owner via a separate file transfer. The schemas below describe what the pipeline emits.
+
 ```text
 datasets/carla_honda_poc_aaa_relight/            # delivered (post relight + compose)
 ├── videos/
