@@ -27,9 +27,17 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+# The configs/ package lives at the repo root, one level above scripts/.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from configs.presets import DatasetConfig, get_preset  # noqa: E402
+
 
 _VIGNETTE_CACHE: dict[tuple[int, int], np.ndarray] = {}
 _SCANLINE_CACHE: dict[tuple[int, int], np.ndarray] = {}
+
+# ponytail: single-run script, so the active preset is a module global set once
+# in main() rather than threaded through every CARLA helper. Read-only after that.
+CONFIG: DatasetConfig = get_preset("aaa")
 
 
 CAMERA_IDS = [
@@ -154,19 +162,26 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate the Honda Smart Car Tracking POC dataset with AAA-style CARLA/CCTV visuals."
     )
-    parser.add_argument("--output-dir", default="datasets/carla_honda_poc_aaa")
-    parser.add_argument("--docs-dir", default="docs/aaa")
+    # Flags that overlap a preset value default to None here and fall back to the
+    # active preset in main(); pass one explicitly to override the preset.
+    parser.add_argument(
+        "--preset",
+        default="aaa",
+        help="Named dataset config from configs/presets.py. Default 'aaa' reproduces the shipped dataset.",
+    )
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--docs-dir", default=None)
     parser.add_argument("--renderer", choices=("storyboard", "carla"), default="carla")
-    parser.add_argument("--num-cars", type=int, default=6)
-    parser.add_argument("--fps", type=int, default=20)
-    parser.add_argument("--duration-sec", type=float, default=60.0)
-    parser.add_argument("--width", type=int, default=1920)
-    parser.add_argument("--height", type=int, default=1080)
+    parser.add_argument("--num-cars", type=int, default=None)
+    parser.add_argument("--fps", type=int, default=None)
+    parser.add_argument("--duration-sec", type=float, default=None)
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--carla-host", default="127.0.0.1")
     parser.add_argument("--carla-port", type=int, default=2000)
-    parser.add_argument("--carla-map", default="Town05_Opt")
+    parser.add_argument("--carla-map", default=None)
     parser.add_argument("--carla-timeout-sec", type=float, default=120.0)
-    parser.add_argument("--random-seed", type=int, default=7)
+    parser.add_argument("--random-seed", type=int, default=None)
     parser.add_argument(
         "--camera-ids",
         default="",
@@ -197,7 +212,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cctv-grain-strength",
         type=float,
-        default=1.35,
+        default=None,
         help="Per-pixel grain standard deviation for CCTV post-process. Use 0 to disable grain.",
     )
     parser.add_argument(
@@ -209,7 +224,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--temporal-blend-strength",
         type=float,
-        default=0.10,
+        default=None,
         help="Frame-to-frame blend strength for temporal stabilization.",
     )
     parser.add_argument(
@@ -219,6 +234,21 @@ def parse_args() -> argparse.Namespace:
         help="Send per-frame velocity/angular-velocity hints to vehicles for better motion rendering.",
     )
     parser.add_argument("--clean", action="store_true", help="Remove previous generated outputs.")
+    parser.add_argument(
+        "--annotations-only",
+        action="store_true",
+        help=(
+            "Re-project bbox annotations only against the running CARLA server: reuse the existing "
+            "videos, skip RGB capture/encode and CCTV post-process, and ignore the per-camera segment "
+            "time windows so each vehicle is annotated for its full in-frame duration."
+        ),
+    )
+    parser.add_argument(
+        "--min-bbox-px",
+        type=int,
+        default=4,
+        help="Minimum projected bbox width/height (pixels) kept in --annotations-only mode.",
+    )
     return parser.parse_args()
 
 
@@ -292,20 +322,7 @@ class ProgressBar:
 
 
 def make_cars(num_cars: int, random_seed: int) -> list[CarSpec]:
-    colors = [
-        (210, 210, 205),
-        (190, 195, 200),
-        (225, 225, 220),
-        (175, 185, 195),
-        (205, 205, 215),
-        (185, 190, 185),
-        (220, 215, 205),
-        (200, 205, 210),
-        (170, 180, 190),
-        (230, 230, 225),
-        (195, 198, 205),
-        (212, 216, 218),
-    ]
+    colors = list(CONFIG.car_colors_bgr)
     cars: list[CarSpec] = []
     rng = random.Random(random_seed)
     good_slots = ["G01", "G02", "G03", "G04", "G05", "G06"]
@@ -345,10 +362,11 @@ def make_cars(num_cars: int, random_seed: int) -> list[CarSpec]:
                 parking_slot_id=slot,
                 color_bgr=colors[idx % len(colors)],
                 start_offset_sec=start_offset_sec,
-                speed_factor=1.18 + (idx % 5) * 0.06,
+                speed_factor=CONFIG.speed_factor_base
+                + (idx % CONFIG.speed_factor_cycle) * CONFIG.speed_factor_step,
             )
         )
-        start_offset_sec += rng.uniform(3.0, 5.0)
+        start_offset_sec += rng.uniform(*CONFIG.start_offset_range_sec)
     return cars
 
 
@@ -1075,15 +1093,7 @@ def build_camera_transforms(carla, route: CarlaRoute) -> dict[str, object]:
         "CAM_06_GOOD_PARKING": route.good[-1].rotation.yaw,
         "CAM_07_DEFECT_PARKING": route.defect[-1].rotation.yaw,
     }
-    camera_plan = {
-        "CAM_01_START": {"yaw_offset": -125.0, "distance": 18.0, "height": 9.0},
-        "CAM_02_TRANSIT": {"yaw_offset": -160.0, "distance": 22.0, "height": 13.0},
-        "CAM_03_JUNCTION_STATUS": {"yaw_offset": -48.0, "distance": 30.0, "height": 17.0},
-        "CAM_04_GOOD_ROUTE": {"yaw_offset": -82.0, "distance": 20.0, "height": 13.0},
-        "CAM_05_DEFECT_ROUTE": {"yaw_offset": 82.0, "distance": 20.0, "height": 13.0},
-        "CAM_06_GOOD_PARKING": {"yaw_offset": 145.0, "distance": 34.0, "height": 15.0},
-        "CAM_07_DEFECT_PARKING": {"yaw_offset": 112.0, "distance": 34.0, "height": 15.0},
-    }
+    camera_plan = CONFIG.camera_plan
     transforms: dict[str, object] = {}
     for camera in CAMERAS:
         target = targets[camera.camera_id]
@@ -1102,14 +1112,7 @@ def build_camera_transforms(carla, route: CarlaRoute) -> dict[str, object]:
 
 
 def carla_camera_fovs() -> dict[str, float]:
-    return {
-        camera.camera_id: {
-            "CAM_02_TRANSIT": 78.0,
-            "CAM_03_JUNCTION_STATUS": 66.0,
-            "CAM_06_GOOD_PARKING": 72.0,
-        }.get(camera.camera_id, 85.0)
-        for camera in CAMERAS
-    }
+    return {camera.camera_id: CONFIG.camera_fovs[camera.camera_id] for camera in CAMERAS}
 
 
 def build_projection_matrix(width: int, height: int, fov: float) -> np.ndarray:
@@ -1245,6 +1248,8 @@ def yolo_like_visible_actor_bbox(
     semantic_tags: np.ndarray | None,
     width: int,
     height: int,
+    min_bbox_px: int = 10,
+    relaxed: bool = False,
 ) -> tuple[list[int] | None, dict[str, object]]:
     bbox, projected = project_actor_bbox_points(actor, camera_transform, intrinsic, width, height)
     if bbox is None:
@@ -1254,7 +1259,12 @@ def yolo_like_visible_actor_bbox(
     box_w = x2 - x1
     box_h = y2 - y1
     area = box_w * box_h
-    if box_w < 10 or box_h < 8 or area < 160:
+    # Relaxed mode keeps far/small but genuinely visible vehicles (e.g. junction,
+    # defect route, parking) instead of culling them like the strict default.
+    min_w = min_bbox_px if relaxed else 10
+    min_h = min_bbox_px if relaxed else 8
+    min_area = (min_bbox_px * min_bbox_px) if relaxed else 160
+    if box_w < min_w or box_h < min_h or area < min_area:
         return None, {"visibility_reject": "bbox_too_small", "projected_bbox": bbox}
 
     projected_in_frame = [
@@ -1266,7 +1276,7 @@ def yolo_like_visible_actor_bbox(
         return None, {"visibility_reject": "no_projected_points_in_frame", "projected_bbox": bbox}
 
     actor_depth = float(np.median([depth for _x, _y, depth in projected_in_frame]))
-    tolerance_m = max(1.5, actor_depth * 0.06)
+    tolerance_m = max(3.0, actor_depth * 0.12) if relaxed else max(1.5, actor_depth * 0.06)
     semantic_visible = False
     semantic_pixels = 0
     semantic_ratio = 0.0
@@ -1282,8 +1292,9 @@ def yolo_like_visible_actor_bbox(
             visible_samples += 1
 
     depth_evidence_ratio = bbox_has_depth_evidence(depth_meters, bbox, actor_depth, tolerance_m * 1.5)
-    min_visible_samples = 1 if area < 3000 else 2
-    if not semantic_visible and visible_samples < min_visible_samples and depth_evidence_ratio < 0.015:
+    min_visible_samples = 1 if (relaxed or area < 3000) else 2
+    depth_ratio_floor = 0.004 if relaxed else 0.015
+    if not semantic_visible and visible_samples < min_visible_samples and depth_evidence_ratio < depth_ratio_floor:
         return None, {
             "visibility_reject": "semantic_depth_occluded",
             "projected_bbox": bbox,
@@ -1703,24 +1714,8 @@ def configure_synchronous_settings(settings: object, fps: int) -> object:
 
 
 def set_weather(carla, world: object) -> None:
-    weather = carla.WeatherParameters(
-        cloudiness=32.0,
-        precipitation=0.0,
-        sun_altitude_angle=28.0,
-        sun_azimuth_angle=128.0,
-        fog_density=1.0,
-        wetness=10.0,
-    )
-    for attr, value in {
-        "fog_distance": 115.0,
-        "fog_falloff": 0.12,
-        "precipitation_deposits": 0.0,
-        "wind_intensity": 4.0,
-        "scattering_intensity": 0.85,
-        "mie_scattering_scale": 0.015,
-        "rayleigh_scattering_scale": 0.0331,
-        "dust_storm": 0.0,
-    }.items():
+    weather = carla.WeatherParameters()
+    for attr, value in CONFIG.weather.items():
         if hasattr(weather, attr):
             setattr(weather, attr, value)
     world.set_weather(weather)
@@ -1826,20 +1821,7 @@ def spawn_carla_cameras(
     camera_bp.set_attribute("image_size_x", str(width))
     camera_bp.set_attribute("image_size_y", str(height))
     camera_bp.set_attribute("sensor_tick", str(1.0 / fps))
-    for attr, value in {
-        "enable_postprocess_effects": "True",
-        "exposure_mode": "manual",
-        "exposure_compensation": "-0.25",
-        "gamma": "2.0",
-        "motion_blur_intensity": "0.12",
-        "lens_flare_intensity": "0.04",
-        "bloom_intensity": "0.12",
-        "chromatic_aberration_intensity": "0.06",
-        "chromatic_aberration_offset": "0.0",
-        "iso": "100.0",
-        "shutter_speed": "180.0",
-        "fstop": "6.3",
-    }.items():
+    for attr, value in CONFIG.rgb_sensor_attributes.items():
         if camera_bp.has_attribute(attr):
             camera_bp.set_attribute(attr, value)
 
@@ -1886,7 +1868,7 @@ def spawn_carla_vehicles(carla, world: object, cars: list[CarSpec], route: Carla
     blueprint_library = world.get_blueprint_library()
     vehicle_blueprints = blueprint_library.filter("vehicle.*")
     preferred = [
-        bp for bp in vehicle_blueprints if "vehicle.lincoln.mkz_2020" in bp.id or "vehicle.tesla.model3" in bp.id
+        bp for bp in vehicle_blueprints if any(wanted in bp.id for wanted in CONFIG.vehicle_blueprints)
     ]
     vehicle_bp = preferred[0] if preferred else vehicle_blueprints[0]
     actors: dict[str, object] = {}
@@ -2024,6 +2006,8 @@ def render_carla(
     temporal_stabilization: bool,
     temporal_blend_strength: float,
     wheel_motion_hints: bool,
+    annotations_only: bool = False,
+    min_bbox_px: int = 4,
 ) -> str:
     carla = import_carla_module()
     log_step(f"Connecting to CARLA at {host}:{port} with timeout {timeout_sec:.0f}s")
@@ -2107,17 +2091,19 @@ def render_carla(
                 depth_queue = depth_queues[camera.camera_id]
                 semantic_actor = semantic_actors[camera.camera_id]
                 semantic_queue = semantic_queues[camera.camera_id]
-                video_path = paths["videos"] / f"{camera.camera_id}.mp4"
-                writer = cv2.VideoWriter(str(video_path), fourcc, fps, (width, height))
-                if not writer.isOpened():
-                    camera_actor.stop()
-                    camera_actor.destroy()
-                    depth_actor.stop()
-                    depth_actor.destroy()
-                    semantic_actor.stop()
-                    semantic_actor.destroy()
-                    raise RuntimeError(f"Could not open video writer: {video_path}")
-                writers[camera.camera_id] = writer
+                writer = None
+                if not annotations_only:
+                    video_path = paths["videos"] / f"{camera.camera_id}.mp4"
+                    writer = cv2.VideoWriter(str(video_path), fourcc, fps, (width, height))
+                    if not writer.isOpened():
+                        camera_actor.stop()
+                        camera_actor.destroy()
+                        depth_actor.stop()
+                        depth_actor.destroy()
+                        semantic_actor.stop()
+                        semantic_actor.destroy()
+                        raise RuntimeError(f"Could not open video writer: {video_path}")
+                    writers[camera.camera_id] = writer
 
                 try:
                     intrinsic = build_projection_matrix(width, height, camera_fovs[camera.camera_id])
@@ -2160,26 +2146,42 @@ def render_carla(
 
                         snapshot = world.tick()
                         sim_frame = snapshot if isinstance(snapshot, int) else snapshot.frame
-                        frame = image_to_bgr(get_sensor_frame(camera_queue, sim_frame))
-                        depth_meters = depth_image_to_meters(get_sensor_frame(depth_queue, sim_frame))
-                        semantic_tags = semantic_image_to_tags(get_sensor_frame(semantic_queue, sim_frame))
+                        # Always drain the RGB/semantic queues to keep them frame-aligned, but only
+                        # decode what we need. In annotations-only mode we skip the costly RGB decode,
+                        # semantic decode, parking overlays, post-process and video encode.
+                        if annotations_only:
+                            get_sensor_frame(camera_queue, sim_frame)
+                            depth_meters = depth_image_to_meters(get_sensor_frame(depth_queue, sim_frame))
+                            get_sensor_frame(semantic_queue, sim_frame)
+                            frame = None
+                            semantic_tags = None
+                        else:
+                            frame = image_to_bgr(get_sensor_frame(camera_queue, sim_frame))
+                            depth_meters = depth_image_to_meters(get_sensor_frame(depth_queue, sim_frame))
+                            semantic_tags = semantic_image_to_tags(get_sensor_frame(semantic_queue, sim_frame))
                         camera_transform = camera_actor.get_transform()
-                        if camera.camera_id == "CAM_06_GOOD_PARKING":
+                        if not annotations_only and camera.camera_id == "CAM_06_GOOD_PARKING":
                             overlay_projected_parking_lot(
                                 frame, carla, route.good_slots, camera_transform, intrinsic, (70, 240, 120)
                             )
-                        elif camera.camera_id == "CAM_07_DEFECT_PARKING":
+                        elif not annotations_only and camera.camera_id == "CAM_07_DEFECT_PARKING":
                             overlay_projected_parking_lot(
                                 frame, carla, route.defect_slots, camera_transform, intrinsic, (90, 90, 255)
                             )
 
                         for car in cars:
-                            visible_window = segment_window(car, camera.camera_id)
-                            if visible_window is None:
-                                continue
-                            visible_start, visible_end = visible_window
-                            if timestamp_sec < visible_start or timestamp_sec > visible_end:
-                                continue
+                            if annotations_only:
+                                # Annotate the car for its full in-frame duration: keep only the
+                                # route-membership check and let the projection decide enter/exit.
+                                if camera.camera_id not in car.route:
+                                    continue
+                            else:
+                                visible_window = segment_window(car, camera.camera_id)
+                                if visible_window is None:
+                                    continue
+                                visible_start, visible_end = visible_window
+                                if timestamp_sec < visible_start or timestamp_sec > visible_end:
+                                    continue
                             route_window_records += 1
                             actor = vehicle_actors[car.tracking_id]
                             bbox, visibility = yolo_like_visible_actor_bbox(
@@ -2190,6 +2192,8 @@ def render_carla(
                                 semantic_tags,
                                 width,
                                 height,
+                                min_bbox_px=min_bbox_px,
+                                relaxed=annotations_only,
                             )
                             if not bbox:
                                 depth_filtered_records += 1
@@ -2212,25 +2216,27 @@ def render_carla(
                                 "world_transform": transform_to_dict(actor.get_transform()),
                             }
                             bbox_fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-                        if cctv_postprocess:
-                            frame = apply_aaa_cctv_postprocess(
-                                frame,
-                                camera.camera_id,
-                                timestamp_sec,
-                                local_frame_id,
-                                cctv_grain_strength,
-                                previous_output_frame if temporal_stabilization else None,
-                                temporal_blend_strength if temporal_stabilization else 0.0,
-                                fps,
-                            )
-                            previous_output_frame = frame.copy()
-                        writer.write(frame)
+                        if not annotations_only:
+                            if cctv_postprocess:
+                                frame = apply_aaa_cctv_postprocess(
+                                    frame,
+                                    camera.camera_id,
+                                    timestamp_sec,
+                                    local_frame_id,
+                                    cctv_grain_strength,
+                                    previous_output_frame if temporal_stabilization else None,
+                                    temporal_blend_strength if temporal_stabilization else 0.0,
+                                    fps,
+                                )
+                                previous_output_frame = frame.copy()
+                            writer.write(frame)
                         render_progress.update(
                             local_frame_id + 1,
                             extra=f"sim_frame={sim_frame}",
                         )
                 finally:
-                    writer.release()
+                    if writer is not None:
+                        writer.release()
                     writers.pop(camera.camera_id, None)
                     try:
                         camera_actor.stop()
@@ -2456,8 +2462,30 @@ def validate_outputs(
         raise RuntimeError(f"Expected {len(CAMERAS)} cameras in camera_graph.json.")
 
 
+def apply_preset_defaults(args: argparse.Namespace, cfg: DatasetConfig) -> None:
+    """Fill any flag left at its None sentinel from the active preset."""
+    for field_name in (
+        "output_dir",
+        "docs_dir",
+        "num_cars",
+        "fps",
+        "duration_sec",
+        "width",
+        "height",
+        "carla_map",
+        "random_seed",
+        "cctv_grain_strength",
+        "temporal_blend_strength",
+    ):
+        if getattr(args, field_name) is None:
+            setattr(args, field_name, getattr(cfg, field_name))
+
+
 def main() -> int:
+    global CONFIG
     args = parse_args()
+    CONFIG = get_preset(args.preset)
+    apply_preset_defaults(args, CONFIG)
     validate_args(args)
 
     output_dir = Path(args.output_dir)
@@ -2487,8 +2515,13 @@ def main() -> int:
             args.temporal_stabilization,
             args.temporal_blend_strength,
             args.wheel_motion_hints,
+            args.annotations_only,
+            args.min_bbox_px,
         )
-        print(f"Generated AAA-style CARLA 3D CCTV videos with CARLA {carla_version}.")
+        if args.annotations_only:
+            print(f"Re-projected bbox annotations with CARLA {carla_version} (videos untouched).")
+        else:
+            print(f"Generated AAA-style CARLA 3D CCTV videos with CARLA {carla_version}.")
     else:
         write_camera_graph(paths["metadata"] / "camera_graph.json")
         write_cars_csv(paths["metadata"] / "cars.csv", cars)

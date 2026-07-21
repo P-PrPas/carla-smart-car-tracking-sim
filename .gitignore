@@ -1,2 +1,6 @@
 datasets/
 docs/video_contact_sheets/
+__pycache__/
+*.pyc
+tmp/
+*.pt.claude/
